@@ -1,0 +1,60 @@
+# space-chat: transport & discovery design
+
+Sub-project 4 of 5 in the space-chat initiative. Covers how two devices establish a connection and exchange the bytes defined by [the protocol & sync design](2026-09-03-protocol-and-sync-design.md). Builds on that spec's message categories and does not redefine them.
+
+## Goals
+
+- Direct device-to-device connections where possible ("Tailscale-style"), without requiring either device to have a stable public IP or manual port forwarding.
+- A fallback path when direct connection isn't possible, without that fallback being able to read message content.
+- Works across a phone switching networks mid-conversation, not just stationary desktops.
+- No new server dependency for the common case of "two people who already know each other want to chat."
+
+## Foundation: `iroh`
+
+Rather than hand-rolling NAT traversal, hole-punching, and relay-selection — a genuinely hard, easy-to-get-subtly-wrong networking problem, the same category of risk that justified reusing Automerge and OpenMLS instead of building our own — space-chat builds transport on **`iroh`** (n0-computer), which shipped a stable 1.0 in June 2026:
+
+- Devices dial each other by public key ("endpoint ID") rather than IP address.
+- QUIC-based hole-punching succeeds directly roughly 9 times out of 10 (per n0's published numbers); the remainder falls back to relay servers.
+- Relays are stateless and forward only encrypted packets addressed to a specific endpoint ID — they cannot read traffic. This is defense-in-depth here, not load-bearing: MLS already encrypts content above the transport layer regardless of relay behavior.
+- Chosen over `rust-libp2p` (more general-purpose, DHT-oriented, ~70% direct hole-punch success rate) because our need is closer to "dial this specific known peer" than "discover and route through an open swarm" — the narrower tool fits better.
+- Chosen over hand-assembling WireGuard (`boringtun`) + a separate NAT-traversal/relay layer because QUIC already provides the encrypted, multiplexed tunnel that combination would have required building.
+
+**v1 relay policy: n0's public relay network**, not self-hosted. Zero infrastructure to run for the fallback path; the tradeoff is a third-party dependency for the ~10% of connections that need it. The source issue's own "n-n-1 peer-server-at-a-price" idea is a real fit for a *self-hosted* relay later — deliberately deferred, not designed away.
+
+## Identity
+
+**Endpoint identity is a separate keypair from the MLS device signing key**, despite both representing "this device." Reusing one keypair across two protocols (QUIC/TLS identity vs. MLS signatures) is poor crypto hygiene — the two protocols carry different assumptions about how a key is used, and an issue discovered in one context shouldn't be able to compromise the other. Both keys are managed together at the storage layer as one device identity, but remain cryptographically independent.
+
+## Pairing / discovery
+
+There is no directory or username-lookup service in v1. A device wanting to invite someone generates a **link or QR code** encoding its iroh endpoint ID and enough context to request joining a specific space. The recipient opens it through whatever out-of-band channel already exists between them (text, email, in person) — the same first-contact model Signal/WhatsApp device linking and most p2p tools use.
+
+**Invite-based joins still route through the space's elected sequencer**, from the protocol spec, rather than using MLS's external-commit self-join mechanism to bypass it. An external commit is still a Commit; letting invite joins skip the sequencer would reopen the concurrent-commit-forking problem that electing a sequencer exists to avoid, growing a second inconsistent membership-change path instead of keeping the one already-documented liveness limitation.
+
+## Wire integration: stream mapping
+
+Each connection opens one long-lived QUIC stream per protocol message category (MLS control, Automerge sync, gossip, ephemeral, attachment transfer). This gives real isolation at the delivery-ordering level — packet loss on one stream doesn't stall already-arrived data on another.
+
+**This alone does not guarantee attachments won't degrade messaging** — all streams share one congestion-controlled connection, so a large transfer can still consume available bandwidth and slow other streams' throughput even without blocking their ordering. **Stream prioritization** (control/sync/gossip ranked above bulk attachment transfer) is what actually delivers the protocol spec's "attachments never head-of-line-block message sync" goal. Worth being explicit that multiplexing and prioritization are two different mechanisms addressing two different problems (ordering vs. bandwidth contention), not one mechanism doing both.
+
+## Resilience properties
+
+- **Roaming**: QUIC identifies connections by connection ID rather than IP:port tuple, so a device switching networks (wifi → cellular) doesn't require tearing down and re-establishing the connection. This falls out of building on QUIC rather than something built separately.
+- **Multi-hop convergence (emergent, not designed machinery)**: because Automerge sync/gossip operate per-space over whatever connections currently exist, a device with no direct-or-relayed path to another member can still receive that member's content through any third device in the same space connected to both — the same way `git fetch` doesn't care which remote actually authored a commit. This requires no new mechanism; it's a consequence of the sync design already specified.
+- **Chunked, resumable attachment transfer**: a dropped connection mid-transfer means re-requesting missing chunks on reconnect, not restarting, consistent with attachments already being content-hash-addressed and chunked.
+
+## Error handling
+
+- Direct hole-punch and relay both fail → falls back to whatever multi-hop path exists through other space members, or waits for connectivity; treated identically to any other offline period via reconcile-on-reconnect. Not a new failure class.
+- Sequencer unreachable over transport → the documented liveness limitation from the protocol spec (membership changes stall, messaging continues). Transport doesn't introduce a new failure mode here, only the trigger condition for an existing, already-accepted one.
+
+## Testing
+
+- Force hole-punch failure and verify clean fallback to relay.
+- Simulate network-interface roaming mid-conversation; verify the connection survives via QUIC connection migration rather than restarting.
+- Multi-hop propagation: two devices with no direct-or-relay path to each other, connected only via a third space member, verifying content still converges.
+
+## Open questions carried forward
+
+- Self-hosted relay ("peer server at a price") remains a real future direction, explicitly deferred rather than designed now.
+- Stream prioritization tuning (exact priority weights between control/sync/gossip streams) is an implementation-tuning parameter, not a design fork.
