@@ -70,7 +70,7 @@ Message categories, once two devices have an authenticated encrypted channel (co
 - **Ephemeral** — typing/read receipts, best-effort, never persisted.
 - **Attachment transfer** — chunked, content-hash-keyed blob request/response, on its own channel so large files never head-of-line-block message sync.
 
-A thin outer envelope (CBOR via `ciborium`) tags which of these five categories a payload belongs to; the payload itself is opaque at that layer (MLS ciphertext, or MLS-application-message-wrapped Automerge/gossip/attachment bytes).
+A thin outer envelope (CBOR via `ciborium`) tags **both which space and which of these five categories** a payload belongs to — `(space_id, category)`, not category alone. Two devices are frequently members of more than one shared space at once, and the category alone can't disambiguate which space's gossip or sync traffic a given frame belongs to. The payload itself is opaque at that layer (MLS ciphertext, or MLS-application-message-wrapped Automerge/gossip/attachment bytes). See the transport spec for how `(space_id, category)` maps onto QUIC streams.
 
 **Sync flow on connect (hybrid gossip + reconcile — chosen over pure pull or pure push):**
 
@@ -90,7 +90,8 @@ MLS assumes a **Delivery Service** — something that gives every group member a
 **v1 answer:** each space elects a **sequencer** device via a deterministic rule (lowest device id among current members). Only the sequencer issues Commits; other members' membership-change requests route through it. This means:
 
 - Messaging is unaffected if the sequencer is offline — gossip/reconcile don't depend on it.
-- Membership changes (add/remove a device) stall if the sequencer is unreachable. This is a documented v1 liveness limitation, not a bug to silently work around. Revisit if it proves too painful in practice — likely direction would be a proper decentralized sequencing scheme, treated as its own sub-project rather than folded in here.
+- Membership changes (add/remove a device) stall if the sequencer is unreachable. This is a documented v1 liveness limitation, not a bug to silently work around.
+- **This can be a permanent dead end, not just a stall.** Only the sequencer can issue a Commit — including the one that would remove the sequencer itself and hand the role to the next-lowest-device-id member. If the sequencer's device is permanently lost (destroyed, wiped, owner unreachable forever) rather than merely temporarily offline, **that space can never change membership again** — there is no bootstrapping path out, since the fix requires a Commit only the now-gone sequencer could issue. This is a materially sharper claim than "stalls," and worth stating as such rather than letting the milder wording imply it always self-resolves once the sequencer returns. Revisit if it proves too painful in practice — likely direction would be a proper decentralized sequencing scheme, treated as its own sub-project rather than folded in here.
 
 ## Error handling
 
