@@ -63,3 +63,4 @@ Within a given space's stream set, isolation still works the same way as previou
 
 - Self-hosted relay ("peer server at a price") remains a real future direction, explicitly deferred rather than designed now.
 - Stream prioritization tuning (exact priority weights between control/sync/gossip streams) is an implementation-tuning parameter, not a design fork.
+- **Networks that block UDP outright (some corporate/hotel/airport networks permit only TCP 80/443) will fail to connect at all**, since iroh is QUIC/UDP-based with no TCP fallback. This surfaced during stress-testing and is documented here as a known limitation rather than designed around — it's an environmental constraint outside this project's control today, not a gap in the transport design itself. A TCP-based fallback transport is the only real fix and would be a genuine future direction, not something to build speculatively now.
