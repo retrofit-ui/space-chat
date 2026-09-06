@@ -82,9 +82,10 @@ fn three_members_converge_after_partition_and_reconnect() {
         &mut alice_carol_c,
     );
 
-    // Simulate a partition: Alice and Bob send messages Carol doesn't see yet.
+    // Simulate a partition: Alice, Bob, and Carol all send messages that others don't see yet.
     send(&mut alice, alice_id, "from alice during partition");
     send(&mut bob, bob_id, "from bob during partition");
+    send(&mut carol, carol_id, "from carol during partition");
 
     // Reconnect: sync every pair until all three match.
     sync_pair(&mut alice, &mut alice_bob_a, &mut bob, &mut alice_bob_b);
@@ -103,9 +104,9 @@ fn three_members_converge_after_partition_and_reconnect() {
         &mut alice_carol_c,
     );
 
-    assert_eq!(alice.message_count(), 2);
-    assert_eq!(bob.message_count(), 2);
-    assert_eq!(carol.message_count(), 2);
+    assert_eq!(alice.message_count(), 3);
+    assert_eq!(bob.message_count(), 3);
+    assert_eq!(carol.message_count(), 3);
 
     // Matching counts alone would also pass if each peer somehow ended up
     // with a different set of 2 messages (e.g. a lost message masked by a
