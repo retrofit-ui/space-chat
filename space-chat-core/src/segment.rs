@@ -4,93 +4,82 @@ use automerge::{
     transaction::Transactable,
     AutoCommit, ObjId, ObjType, ReadDoc, Value, ROOT,
 };
-use std::fmt;
+use uuid::Uuid;
+
+/// Prefix marking a top-level ROOT key as a message entry, distinguishing it
+/// from any other top-level content this document might hold in the future.
+const MESSAGE_KEY_PREFIX: &str = "msg:";
 
 /// One epoch's worth of messages, backed by an Automerge document.
 ///
-/// Messages are stored append-only in a "messages" list at the document
-/// root, keeping the doc append-mostly per the protocol spec's no-edit
-/// decision. Later tasks (Reaction/Delete application, sync exchange) build
-/// on the exact shape of this list.
+/// Each message is stored as its own map object at a unique
+/// `"msg:<uuid>"` key directly under `ROOT` -- not nested inside any shared
+/// list or map container. This is deliberate: two independently-created
+/// `Segment`s (e.g. two devices' fresh segments at an epoch boundary, never
+/// synced before) must be able to each create messages and then sync
+/// without conflict. `ROOT` itself always exists in every Automerge
+/// document -- nobody "creates" it, so there's nothing to conflict over --
+/// and two peers writing to two different (random-UUID) keys under `ROOT`
+/// is never a conflict, regardless of shared causal history. A shared
+/// "messages" list container was tried first and rejected: two peers each
+/// independently calling `put_object(ROOT, "messages", ObjType::List)` is a
+/// concurrent write to the *same* key from two unrelated objects, which
+/// Automerge resolves via last-writer-wins at the key level -- silently
+/// discarding one entire side's list, not merging it.
 pub struct Segment {
     doc: AutoCommit,
-    /// Object ID of the root "messages" list. Cached at construction time
-    /// (`new` or `load`) once its presence and shape have been validated, so
-    /// every other method can rely on it existing without re-checking.
-    messages: ObjId,
-}
-
-/// Error returned by [`Segment::load`] when `bytes` decode as a valid
-/// Automerge document but don't have the schema `Segment` expects (e.g. no
-/// "messages" list at the document root). This is distinct from
-/// `automerge::AutomergeError`, which only covers malformed Automerge bytes,
-/// not a mismatched application schema.
-#[derive(Debug)]
-pub enum SegmentLoadError {
-    /// The bytes could not be decoded as an Automerge document at all.
-    Automerge(automerge::AutomergeError),
-    /// The bytes decoded fine, but there is no "messages" list at ROOT.
-    MissingMessagesList,
-}
-
-impl fmt::Display for SegmentLoadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SegmentLoadError::Automerge(e) => write!(f, "failed to decode Automerge document: {e}"),
-            SegmentLoadError::MissingMessagesList => {
-                write!(
-                    f,
-                    "document is missing the expected \"messages\" list at ROOT"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SegmentLoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SegmentLoadError::Automerge(e) => Some(e),
-            SegmentLoadError::MissingMessagesList => None,
-        }
-    }
-}
-
-impl From<automerge::AutomergeError> for SegmentLoadError {
-    fn from(e: automerge::AutomergeError) -> Self {
-        SegmentLoadError::Automerge(e)
-    }
 }
 
 impl Segment {
     pub fn new() -> Self {
-        let mut doc = AutoCommit::new();
-        let messages = doc
-            .put_object(ROOT, "messages", ObjType::List)
-            .expect("creating the root messages list cannot fail on a fresh doc");
-        Self { doc, messages }
-    }
-
-    /// Looks up and validates the "messages" list at ROOT of an already
-    /// loaded document, returning its object ID. Used by `load` to restore
-    /// the invariant (normally established by `new`) that a constructed
-    /// `Segment` always has a well-formed "messages" list.
-    fn find_messages_list(doc: &AutoCommit) -> Result<ObjId, SegmentLoadError> {
-        match doc.get(ROOT, "messages")? {
-            Some((Value::Object(ObjType::List), id)) => Ok(id),
-            _ => Err(SegmentLoadError::MissingMessagesList),
+        Self {
+            doc: AutoCommit::new(),
         }
     }
 
-    /// Appends `msg` as a new map at the end of the root "messages" list and
+    /// Generates a fresh, unique key for a new message entry. Uses a random
+    /// UUID so concurrently-created messages from different senders (who
+    /// share no coordination beyond both writing under the same `ROOT`)
+    /// cannot collide.
+    fn new_message_key() -> String {
+        format!("{MESSAGE_KEY_PREFIX}{}", Uuid::new_v4())
+    }
+
+    /// Returns the Automerge object ID of the message stored at `key`, or
+    /// `None` if `key` doesn't hold a well-formed message entry -- e.g.
+    /// there's nothing there, the value isn't a map, or the map is missing
+    /// the required `content` field. This never panics, even against a
+    /// foreign/malformed/adversarial document: callers use it to skip bad
+    /// entries rather than crash the whole segment.
+    pub fn message(&self, key: &str) -> Option<ObjId> {
+        let (value, id) = self.doc.get(ROOT, key).ok()??;
+        if !matches!(value, Value::Object(ObjType::Map)) {
+            return None;
+        }
+        // A well-formed message always has a "content" field; treat its
+        // absence as a sign this entry isn't one of ours.
+        self.doc.get(&id, "content").ok()?.map(|_| id)
+    }
+
+    /// Iterates the `"msg:"`-prefixed keys directly under `ROOT`, in no
+    /// particular order. Includes keys that turn out to be malformed when
+    /// passed to [`Segment::message`]; callers that need only well-formed
+    /// entries should filter through `message`.
+    pub fn message_keys(&self) -> impl Iterator<Item = String> + '_ {
+        self.doc
+            .keys(ROOT)
+            .filter(|key| key.starts_with(MESSAGE_KEY_PREFIX))
+    }
+
+    /// Appends `msg` as a new map at a fresh unique key under `ROOT` and
     /// returns the Automerge object ID of the newly created map, which
     /// later tasks use as the addressable target for Reactions/Deletes.
     pub fn append_message(&mut self, msg: &Message) -> ObjId {
-        let idx = self.doc.length(&self.messages);
+        let key = Self::new_message_key();
         let entry = self
             .doc
-            .insert_object(&self.messages, idx, ObjType::Map)
-            .expect("inserting into the messages list cannot fail");
+            .put_object(ROOT, &key, ObjType::Map)
+            .expect("creating a message map at a fresh UUID key cannot fail");
         self.doc
             .put(&entry, "sender", msg.sender.0.to_vec())
             .expect("put on a freshly-inserted map cannot fail");
@@ -124,9 +113,16 @@ impl Segment {
         entry
     }
 
-    /// Number of messages currently stored in this segment.
+    /// Number of well-formed messages currently stored in this segment.
+    ///
+    /// Counts only `"msg:"`-prefixed keys under `ROOT` whose value passes
+    /// the same shape check as [`Segment::message`]; a malformed entry
+    /// (e.g. from a foreign/adversarial document) is silently skipped
+    /// rather than counted or causing a panic.
     pub fn message_count(&self) -> usize {
-        self.doc.length(&self.messages)
+        self.message_keys()
+            .filter(|key| self.message(key).is_some())
+            .count()
     }
 
     /// Serializes the full document (compacted) to bytes for persistence or
@@ -137,15 +133,19 @@ impl Segment {
 
     /// Reconstructs a `Segment` from bytes previously produced by `save`.
     ///
-    /// Returns `Err(SegmentLoadError)` if `bytes` don't decode as an
-    /// Automerge document, or decode fine but lack the "messages" list at
-    /// ROOT that every other `Segment` method relies on. `bytes` may
-    /// originate from another peer over the network (see sync exchange), so
-    /// this validates rather than trusting the input's shape.
-    pub fn load(bytes: &[u8]) -> Result<Self, SegmentLoadError> {
+    /// Returns `Err` only if `bytes` don't decode as an Automerge document
+    /// at all. Unlike the prior "messages list" design, there is no single
+    /// required container whose absence makes the whole document invalid:
+    /// a document with zero `"msg:"`-prefixed keys is simply an empty
+    /// segment, and individual malformed message entries are handled
+    /// per-entry by [`Segment::message`] / [`Segment::message_count`], not
+    /// rejected at load time. `bytes` may originate from another peer over
+    /// the network (see sync exchange), so those per-entry checks matter,
+    /// but they don't belong at load time since a message-shaped entry
+    /// could legitimately arrive *after* load, via a later sync message.
+    pub fn load(bytes: &[u8]) -> Result<Self, automerge::AutomergeError> {
         let doc = AutoCommit::load(bytes)?;
-        let messages = Self::find_messages_list(&doc)?;
-        Ok(Self { doc, messages })
+        Ok(Self { doc })
     }
 
     /// Generates the next sync message to send to the peer tracked by
@@ -227,7 +227,13 @@ mod tests {
         let loaded = Segment::load(&bytes).unwrap();
         assert_eq!(loaded.message_count(), 1);
 
-        let entry = loaded.doc.get(&loaded.messages, 0).unwrap().unwrap().1;
+        let key = loaded
+            .message_keys()
+            .next()
+            .expect("expected exactly one message key");
+        let entry = loaded
+            .message(&key)
+            .expect("message entry should be well-formed");
         let attachments_obj = loaded.doc.get(&entry, "attachments").unwrap().unwrap().1;
         assert_eq!(loaded.doc.length(&attachments_obj), 1);
 
@@ -347,29 +353,19 @@ mod tests {
         assert!(!alice_heads.is_empty());
     }
 
-    /// KNOWN GAP — see task-4-report.md. This is the convergence test from
-    /// the Task 4 plan, and it fails, but not because sync-message exchange
-    /// is broken (see `two_segments_converge_to_the_same_document_via_sync_messages`,
-    /// which passes). `Segment::new` calls
+    /// This is the convergence test from the Task 4 plan. It used to fail
+    /// (see git history / task-4-report.md for the original `#[ignore]`
+    /// reason): `Segment::new` used to call
     /// `put_object(ROOT, "messages", ObjType::List)` independently on each
-    /// side. When two independently-created segments sync, that's a
+    /// side, and two independently-created segments syncing was a
     /// concurrent write to the *same* ROOT map key from two unrelated
-    /// objects, which Automerge resolves as a conflict: `get()` on a
-    /// conflicted key deterministically picks ONE winning value on all
-    /// peers (confirmed here — both sides agree on the same winning
-    /// object ID), discarding the other side's list from the visible
-    /// document. Both peers converge on identical bytes, but the "messages"
-    /// list only ever contains one side's message, not the union of both.
-    /// Automerge lists merge insertions cleanly only when peers share the
-    /// *same* list object (e.g. one peer creates it, others `load`/fork
-    /// from that document) — not when each peer independently creates its
-    /// own list at the same key. Fixing this requires a decision above
-    /// Task 4's scope (see report): either restructure "messages" as a map
-    /// keyed by unique message ID (concurrent writes to distinct keys don't
-    /// conflict), or change the `Segment` lifecycle so only one peer ever
-    /// calls `Segment::new()` and others join via `load`.
+    /// objects, which Automerge resolves as a conflict, discarding one
+    /// side's entire list. Now that each message lives at its own unique
+    /// `"msg:<uuid>"` key directly under `ROOT` (see the `Segment` doc
+    /// comment), two peers appending concurrently write to two different
+    /// keys, which is never a conflict -- so both messages survive sync on
+    /// both sides.
     #[test]
-    #[ignore = "blocked: Segment::new()'s independent \"messages\" list creation conflicts on sync; see task-4-report.md"]
     fn two_segments_converge_via_sync_messages() {
         let mut alice = Segment::new();
         let mut bob = Segment::new();
@@ -394,18 +390,84 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_document_without_a_messages_list() {
-        // Build a valid Automerge document by hand that simply doesn't have
-        // our expected "messages" list at ROOT.
+    fn load_accepts_a_document_with_no_messages_at_all() {
+        // A document with unrelated top-level content and zero "msg:"-keyed
+        // entries is a legitimate, freshly-created-and-never-appended-to
+        // segment, not an error: there's no single "messages container"
+        // left to be missing.
         let mut doc = AutoCommit::new();
-        doc.put(ROOT, "not_messages", "surprise")
+        doc.put(ROOT, "not_a_message", "surprise")
             .expect("put on a fresh doc cannot fail");
         let bytes = doc.save();
 
-        let result = Segment::load(&bytes);
+        let loaded = Segment::load(&bytes).expect("a plain Automerge doc should load fine");
+        assert_eq!(loaded.message_count(), 0);
+    }
+
+    #[test]
+    fn load_rejects_undecodable_bytes() {
+        let result = Segment::load(b"not an automerge document");
         assert!(
             result.is_err(),
-            "expected Segment::load to reject a document without a messages list"
+            "expected Segment::load to reject bytes that aren't a valid Automerge document"
         );
+    }
+
+    #[test]
+    fn message_count_ignores_non_message_keys_at_root() {
+        let mut segment = Segment::new();
+        segment
+            .doc
+            .put(ROOT, "some_other_top_level_key", "unrelated content")
+            .expect("put on ROOT cannot fail");
+
+        assert_eq!(
+            segment.message_count(),
+            0,
+            "a top-level key without the \"msg:\" prefix must not be counted as a message"
+        );
+    }
+
+    #[test]
+    fn message_count_skips_malformed_message_entries_without_panicking() {
+        let mut segment = Segment::new();
+
+        // A "msg:"-prefixed key whose value is a plain scalar, not a map at
+        // all -- e.g. from a foreign/adversarial/corrupted document.
+        segment
+            .doc
+            .put(ROOT, "msg:not-a-map", "surprise")
+            .expect("put on ROOT cannot fail");
+
+        // A "msg:"-prefixed key whose value is a map, but missing the
+        // required "content" field.
+        segment
+            .doc
+            .put_object(ROOT, "msg:missing-content", ObjType::Map)
+            .expect("put_object on ROOT cannot fail");
+
+        // Neither malformed entry should panic or be counted.
+        assert_eq!(segment.message_count(), 0);
+
+        // A real, well-formed message alongside the malformed entries is
+        // still counted correctly.
+        segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "a real message".to_string(),
+            attachments: vec![],
+        });
+        assert_eq!(segment.message_count(), 1);
+    }
+
+    #[test]
+    fn message_accessor_returns_none_for_malformed_or_missing_keys() {
+        let mut segment = Segment::new();
+        segment
+            .doc
+            .put(ROOT, "msg:not-a-map", "surprise")
+            .expect("put on ROOT cannot fail");
+
+        assert!(segment.message("msg:not-a-map").is_none());
+        assert!(segment.message("msg:does-not-exist").is_none());
     }
 }
