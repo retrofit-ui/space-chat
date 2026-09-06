@@ -49,6 +49,7 @@ Within a given space's stream set, isolation still works the same way as previou
 
 ## Error handling
 
+- **Backgrounded/killed mobile app → no live connection at all, by design, not a bug.** iroh connections don't survive the OS suspending or killing the app process. Whether and how this gets mitigated per platform (it does, partially, on Android; it structurally can't on iOS without violating the project's server-free decision) is covered in the app-shell spec's "Background delivery (mobile)" section — this transport spec doesn't attempt to solve it, since the fix (or lack of one) lives at the platform/app-shell layer, not the connection layer.
 - Direct hole-punch and relay both fail → falls back to whatever multi-hop path exists through other space members, or waits for connectivity; treated identically to any other offline period via reconcile-on-reconnect. Not a new failure class.
 - Sequencer unreachable over transport → the documented liveness limitation from the protocol spec (membership changes stall, messaging continues). Transport doesn't introduce a new failure mode here, only the trigger condition for an existing, already-accepted one.
 
