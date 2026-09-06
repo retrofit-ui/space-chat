@@ -1,14 +1,18 @@
-use crate::domain::Message;
+use crate::domain::{Message, Reaction};
 use automerge::{
     sync::{self, SyncDoc},
     transaction::Transactable,
-    AutoCommit, ObjId, ObjType, ReadDoc, Value, ROOT,
+    AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT,
 };
 use uuid::Uuid;
 
 /// Prefix marking a top-level ROOT key as a message entry, distinguishing it
 /// from any other top-level content this document might hold in the future.
 const MESSAGE_KEY_PREFIX: &str = "msg:";
+
+/// Prefix marking a key on a message map as a reaction entry, mirroring
+/// `MESSAGE_KEY_PREFIX`'s role at `ROOT`.
+const REACTION_KEY_PREFIX: &str = "reaction:";
 
 /// One epoch's worth of messages, backed by an Automerge document.
 ///
@@ -43,6 +47,16 @@ impl Segment {
     /// cannot collide.
     fn new_message_key() -> String {
         format!("{MESSAGE_KEY_PREFIX}{}", Uuid::new_v4())
+    }
+
+    /// Generates a fresh, unique key for a new reaction entry, for the same
+    /// reason [`Segment::new_message_key`] does: two peers who both already
+    /// have `target` (via prior sync) and independently react to it before
+    /// hearing about each other's reaction must not collide. A shared
+    /// "reactions" list container was rejected for the same reason a
+    /// shared "messages" list was -- see the `Segment` doc comment.
+    fn new_reaction_key() -> String {
+        format!("{REACTION_KEY_PREFIX}{}", Uuid::new_v4())
     }
 
     /// Returns the Automerge object ID of the message stored at `key`, or
@@ -123,6 +137,78 @@ impl Segment {
         self.message_keys()
             .filter(|key| self.message(key).is_some())
             .count()
+    }
+
+    /// Attaches `reaction` to `target` (a message's `ObjId`, obtained via
+    /// [`Segment::message`]) and returns the Automerge object ID of the
+    /// newly created reaction entry.
+    ///
+    /// Each reaction is stored as its own map at a fresh unique
+    /// `"reaction:<uuid>"` key directly on `target`, not inside a shared
+    /// list -- the same fix applied to messages (see the `Segment` doc
+    /// comment) applied one level deeper: two peers who both already have
+    /// `target` and independently react to it before syncing with each
+    /// other would otherwise each create a "reactions" list at the same
+    /// `(target, "reactions")` key with no causal link between the two
+    /// creation events, which Automerge resolves via last-writer-wins,
+    /// silently discarding one side's reaction.
+    pub fn append_reaction(&mut self, target: &ObjId, reaction: &Reaction) -> ObjId {
+        let key = Self::new_reaction_key();
+        let entry = self
+            .doc
+            .put_object(target, &key, ObjType::Map)
+            .expect("creating a reaction map at a fresh UUID key cannot fail");
+        self.doc
+            .put(&entry, "actor", reaction.actor.0.to_vec())
+            .expect("put on a freshly-inserted map cannot fail");
+        self.doc
+            .put(&entry, "emoji", reaction.emoji.clone())
+            .expect("put on a freshly-inserted map cannot fail");
+        entry
+    }
+
+    /// Number of reaction entries attached to `target`.
+    ///
+    /// Counts `"reaction:"`-prefixed keys on `target`, mirroring how
+    /// [`Segment::message_count`] counts `"msg:"`-prefixed keys on `ROOT`.
+    /// This must be computed by counting keys, not by reading the length of
+    /// a shared list, precisely because there is no shared list --
+    /// concurrently-created reactions land at distinct keys, and counting
+    /// keys is what makes `reaction_count` reflect all of them after sync,
+    /// not just whichever side's container won a conflict.
+    pub fn reaction_count(&self, target: &ObjId) -> usize {
+        self.doc
+            .keys(target)
+            .filter(|key| key.starts_with(REACTION_KEY_PREFIX))
+            .count()
+    }
+
+    /// Marks `target` deleted by setting a `"deleted"` tombstone field to
+    /// `true`, without removing the structural entry -- per the protocol
+    /// spec, other peers still need the entry present to know to hide it.
+    ///
+    /// This is a plain scalar `put` at a fixed key, not a unique-key
+    /// scheme: `target` is an object both peers can only have obtained via
+    /// prior sync (there's no way to call `apply_delete` on an `ObjId` you
+    /// don't already hold), so both sides already share causal history at
+    /// that key. Concurrent writes of the same scalar value (`true`) to an
+    /// already-shared key are safe -- whichever way Automerge's
+    /// last-writer-wins resolves the conflict, the surviving value is
+    /// still `true` -- unlike creating a brand-new object at a key with no
+    /// shared ancestor, which is the hazard `append_reaction` and
+    /// `append_message` avoid.
+    pub fn apply_delete(&mut self, target: &ObjId) {
+        self.doc
+            .put(target, "deleted", true)
+            .expect("put on a valid target cannot fail");
+    }
+
+    /// Whether `target` has been marked deleted via [`Segment::apply_delete`].
+    pub fn is_deleted(&self, target: &ObjId) -> bool {
+        matches!(
+            self.doc.get(target, "deleted"),
+            Ok(Some((Value::Scalar(s), _))) if matches!(*s, ScalarValue::Boolean(true))
+        )
     }
 
     /// Serializes the full document (compacted) to bytes for persistence or
@@ -469,5 +555,136 @@ mod tests {
 
         assert!(segment.message("msg:not-a-map").is_none());
         assert!(segment.message("msg:does-not-exist").is_none());
+    }
+
+    #[test]
+    fn reaction_and_delete_apply_to_a_message() {
+        use crate::domain::Reaction;
+
+        let mut segment = Segment::new();
+        let msg_id = segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "react to me".to_string(),
+            attachments: vec![],
+        });
+
+        segment.append_reaction(
+            &msg_id,
+            &Reaction {
+                target: format!("{msg_id:?}"),
+                actor: DeviceId([2u8; 32]),
+                emoji: "\u{1F44D}".to_string(),
+            },
+        );
+        assert_eq!(segment.reaction_count(&msg_id), 1);
+
+        segment.apply_delete(&msg_id);
+        assert!(segment.is_deleted(&msg_id));
+        // Deleting doesn't remove the structural entry -- per the protocol
+        // spec, other peers still need it to know to hide the message.
+        assert_eq!(segment.message_count(), 1);
+    }
+
+    /// Two independently-created `Segment`s each append a message, sync so
+    /// both sides have the same message `ObjId`, then *without any further
+    /// sync in between* each independently reacts to that shared message.
+    /// If reactions were stored in a shared "reactions" list container
+    /// (the brief's stale example), this would be exactly the Task 4 bug
+    /// one level deeper: two independent `put_object(target, "reactions",
+    /// ObjType::List)` calls at the same key with no causal link, resolved
+    /// by last-writer-wins, silently discarding one side's reaction. With
+    /// reactions stored as their own map at a unique `"reaction:<uuid>"`
+    /// key directly on `target`, both reactions survive the final sync.
+    #[test]
+    fn concurrent_reactions_from_independent_segments_both_survive_sync() {
+        use crate::domain::Reaction;
+
+        let mut alice = Segment::new();
+        let mut bob = Segment::new();
+
+        let msg_id = alice.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "react to me".to_string(),
+            attachments: vec![],
+        });
+
+        // Sync so bob has the same message object before either side reacts.
+        let mut alice_state = sync_state();
+        let mut bob_state = sync_state();
+        run_sync_to_completion(&mut alice, &mut alice_state, &mut bob, &mut bob_state);
+        assert_eq!(bob.message_count(), 1);
+        let bob_msg_id = bob
+            .message_keys()
+            .next()
+            .and_then(|k| bob.message(&k))
+            .expect("bob should have received alice's message");
+
+        // Now both react concurrently, with no sync in between.
+        alice.append_reaction(
+            &msg_id,
+            &Reaction {
+                target: format!("{msg_id:?}"),
+                actor: DeviceId([1u8; 32]),
+                emoji: "\u{1F44D}".to_string(),
+            },
+        );
+        bob.append_reaction(
+            &bob_msg_id,
+            &Reaction {
+                target: format!("{bob_msg_id:?}"),
+                actor: DeviceId([2u8; 32]),
+                emoji: "\u{2764}".to_string(),
+            },
+        );
+
+        run_sync_to_completion(&mut alice, &mut alice_state, &mut bob, &mut bob_state);
+
+        assert_eq!(
+            alice.reaction_count(&msg_id),
+            2,
+            "both concurrently-created reactions should survive sync on alice's side"
+        );
+        assert_eq!(
+            bob.reaction_count(&bob_msg_id),
+            2,
+            "both concurrently-created reactions should survive sync on bob's side"
+        );
+    }
+
+    /// Same hazard, but for deletes: two independently-created `Segment`s
+    /// each already have `target` via prior sync, then both concurrently
+    /// call `apply_delete` before syncing again. Unlike reactions, this is
+    /// safe even without a unique-key scheme: `apply_delete` is a `put` of
+    /// the same scalar value (`true`) at a fixed `"deleted"` key on an
+    /// object both peers already share causal history for, so even if
+    /// Automerge's conflict resolution picks "the other side's" write, the
+    /// result is still `true` on both sides.
+    #[test]
+    fn concurrent_deletes_from_independent_segments_are_preserved_after_sync() {
+        let mut alice = Segment::new();
+        let mut bob = Segment::new();
+
+        let msg_id = alice.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "delete me".to_string(),
+            attachments: vec![],
+        });
+
+        let mut alice_state = sync_state();
+        let mut bob_state = sync_state();
+        run_sync_to_completion(&mut alice, &mut alice_state, &mut bob, &mut bob_state);
+        let bob_msg_id = bob
+            .message_keys()
+            .next()
+            .and_then(|k| bob.message(&k))
+            .expect("bob should have received alice's message");
+
+        alice.apply_delete(&msg_id);
+        bob.apply_delete(&bob_msg_id);
+
+        run_sync_to_completion(&mut alice, &mut alice_state, &mut bob, &mut bob_state);
+
+        assert!(alice.is_deleted(&msg_id));
+        assert!(bob.is_deleted(&bob_msg_id));
     }
 }
