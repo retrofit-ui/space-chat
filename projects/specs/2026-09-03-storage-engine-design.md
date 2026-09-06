@@ -81,9 +81,23 @@ This is deliberately simpler than reference counting (no drift-prone incremental
 
 ## Testing
 
-- Kill-and-restart tests that interrupt writes mid-flight (segment file write, `redb` transaction, Tantivy commit independently) and verify each projection's watermark-based catch-up converges to the same state as an uninterrupted run.
-- Mark-and-sweep GC simulated across multiple devices with staggered sync timing, verifying a reference re-added during the grace window always cancels a pending deletion, and content is never lost when at least one referencing peer stays reachable within the window.
-- Rebuild-from-segments tests: wipe `ListingIndex` and `SearchIndex` independently and confirm both fully reconstruct from `segments/` alone.
+Uses the shared multi-actor `cucumber-rs`+`fantoccini` harness defined in the app-shell spec's Testing section. Most storage-layer failures have no direct UI representation (a GC sweep or a watermark catch-up isn't itself rendered), so scenarios here mostly assert the **user-visible consequence** of a storage-layer event rather than internal store state directly — falling back to internal assertions only where there genuinely isn't one:
+
+```gherkin
+Feature: Attachment garbage collection respects cross-peer liveness
+
+  Scenario: An attachment isn't lost if a peer holding the only other reference is offline within the grace window
+    Given Alice and Bob share an attachment referenced only in one message
+    And Bob goes offline
+    When Alice deletes the message referencing the attachment
+    And 20 days pass
+    And Bob comes online
+    Then Bob's conversation view still shows the attachment as available
+```
+
+- Kill-and-restart tests that interrupt writes mid-flight (segment file write, `redb` transaction, Tantivy commit independently): asserted via the actor's conversation view showing correct, complete history after restart, not by inspecting `Projection` watermarks directly.
+- Mark-and-sweep GC timing itself (the `first_seen_unreferenced` bookkeeping, the 30-day threshold) has no UI outcome to assert and stays a direct unit test against `AttachmentMetadataStore`, run alongside the Gherkin suite.
+- Rebuild-from-segments: wipe `ListingIndex` and `SearchIndex` independently and confirm the actor's UI (conversation view, search results) is indistinguishable from before the wipe once rebuilt — asserting the observable outcome rather than the rebuild mechanism.
 
 ## Open questions carried forward
 

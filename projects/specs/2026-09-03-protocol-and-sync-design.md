@@ -102,12 +102,27 @@ MLS assumes a **Delivery Service** — something that gives every group member a
 
 ## Testing strategy
 
-Correctness here lives in multi-peer eventual-consistency behavior, which example-based unit tests won't catch. Testing should simulate:
+Correctness here lives in multi-peer eventual-consistency behavior, which example-based unit tests won't catch. Uses the shared multi-actor `cucumber-rs`+`fantoccini` harness defined in the app-shell spec's Testing section — real per-actor stacks over a local iroh test relay, asserting through rendered UI wherever the outcome is user-visible. Scenarios:
 
-- Partition and reconnect across 2+ peers, with messages created on both sides during the partition.
-- Concurrent membership-change proposals racing against the sequencer rule.
-- Out-of-order Commit and gossip delivery.
-- Automerge sync convergence under randomized message/attachment-ref creation (property-based).
+```gherkin
+Feature: Convergence under partition and concurrent membership changes
+
+  Scenario: Both sides of a partition converge after reconnecting
+    Given Alice and Bob are members of a space, then become partitioned from each other
+    When Alice sends "from alice" and Bob sends "from bob" while partitioned
+    And Alice and Bob reconnect
+    Then Alice's conversation view shows both messages
+    And Bob's conversation view shows both messages in the same order
+
+  Scenario: Concurrent membership requests both route through the sequencer, no fork
+    Given Alice, Bob, and Carol are members of a space with Alice's device as sequencer
+    When Bob and Carol both request adding a new device at nearly the same time
+    Then exactly one add is applied first and the other follows it
+    And all three members' conversation views show the same final membership
+```
+
+- Out-of-order Commit and gossip delivery — same harness, injecting deliberate reordering at the transport step rather than a separate mechanism.
+- Automerge sync convergence under randomized message/attachment-ref creation (property-based) — this one has no single user-visible outcome to assert in the UI, so it stays a lower-level property test directly against `space-chat-core`, run alongside the Gherkin suite rather than folded into it.
 
 ## Open questions carried forward
 

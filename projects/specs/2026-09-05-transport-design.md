@@ -55,9 +55,28 @@ Within a given space's stream set, isolation still works the same way as previou
 
 ## Testing
 
-- Force hole-punch failure and verify clean fallback to relay.
-- Simulate network-interface roaming mid-conversation; verify the connection survives via QUIC connection migration rather than restarting.
-- Multi-hop propagation: two devices with no direct-or-relay path to each other, connected only via a third space member, verifying content still converges.
+Uses the shared multi-actor `cucumber-rs`+`fantoccini` harness defined in the app-shell spec's Testing section, against `iroh`'s local test relay (`iroh::test_utils::run_relay_server()`) rather than production relay infrastructure:
+
+```gherkin
+Feature: Message delivery survives connectivity failure modes
+
+  Scenario: Content still converges with no direct path, via a third member
+    Given Alice, Bob, and Carol are members of a space
+    And Alice and Carol have no direct or relay path to each other
+    And Alice and Bob, and Bob and Carol, are each connected
+    When Alice sends the message "hello"
+    Then Carol's conversation view shows "hello" within 10 seconds
+
+  Scenario: A network interface change mid-conversation doesn't drop the conversation
+    Given Alice and Bob are connected and Alice sends "before roam"
+    When Alice's device switches network interfaces
+    Then Alice's conversation view still shows "before roam"
+    When Alice sends "after roam"
+    Then Bob's conversation view shows "after roam" within 2 seconds
+```
+
+- Force hole-punch failure and verify clean fallback to relay — same harness, asserting message delivery still succeeds rather than inspecting connection internals directly.
+- Attachment-specific reachability (the narrower, direct-endpoint-only bound from the Resilience properties section above) gets its own scenario distinct from the message-convergence one, since the two have different reachability guarantees and conflating them in one scenario would hide that distinction.
 
 ## Open questions carried forward
 

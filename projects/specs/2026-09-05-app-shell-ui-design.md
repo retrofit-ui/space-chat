@@ -51,12 +51,37 @@ This mirrors the same "gossip is a latency optimization, reconcile is the correc
 - **Backend restart needs no new mechanism.** A restarted core's version counter resets to zero; any version the frontend then quotes is "unknown" to the new instance, which the existing `diff_since` logic already resolves via a full resend (`PatchResponse::Full`). The frontend's patch handler already accepts an unrequested full response, since the original prototype's fallback path already does this for its own reasons (client too far behind).
 - **Spec-generation failure for one conversation** (e.g. a malformed segment) should degrade that conversation's view to an error state, not crash the whole app shell — isolate failures per-conversation the same way the sync engine isolates per-space state.
 
-## Testing
+## Testing: the shared multi-actor harness (used by all four specs)
 
-- Golden path: open a conversation, send a message, verify a patch event arrives and the local renderer reflects it without a full resend.
+This is the canonical description of the integration testing approach; the protocol, storage, and transport specs' Testing sections reference this rather than each defining their own harness.
+
+**Framework: `cucumber-rs` + `fantoccini`.** Scenarios are written as Gherkin `.feature` files (`Given`/`When`/`Then`) — these are simultaneously the test suite and a human-readable spec of expected behavior, which is the point: a reviewer (or a future contributor) can read what a scenario asserts without reading Rust. Step definitions are async Rust, using `fantoccini` (a pure-Rust WebDriver client) to drive real, rendered Tauri UI through the platform-appropriate WebDriver bridge Tauri's own docs describe — assertions read actual DOM state, not internal spec JSON, per the goal of testing what a user would actually see.
+
+**Actor emulation**: a scenario like "Given Alice and Bob are online, Carol is offline" spins up one full, real, in-process stack per actor (`space-chat-core` + `space-chat-storage-redb` + `space-chat-search-tantivy` + `space-chat-openmls` + a real `iroh::Endpoint`) rooted at its own temp directory, connected over a **local iroh test relay** (`iroh::test_utils::run_relay_server()`) rather than production infrastructure or a hand-rolled network simulator — this is real code exercising real sync/transport/storage, not a mock of any of it. "Carol is offline" means her actor simply isn't given a connection at all, not a special-cased flag; "Carol comes online" spins up her connection mid-scenario, exactly like a real reconnect.
+
+**Example scenario, illustrating the actor-absence case the app-shell spec's mobile-delivery decision depends on:**
+
+```gherkin
+Feature: Message delivery across actor presence states
+
+  Scenario: A message sent while a peer is offline still arrives after reconnect
+    Given Alice and Bob are online devices in the same space
+    And Carol is a member of the space but is offline
+    When Alice sends the message "hello"
+    Then Bob's conversation view shows "hello" within 2 seconds
+    And Carol's conversation view does not show "hello"
+    When Carol comes online
+    Then Carol's conversation view shows "hello" within 10 seconds
+```
+
+This is the template every other spec's scenarios follow: express the actor topology in `Given`, the action in `When`, the **rendered UI outcome** in `Then` — falling back to asserting internal state only where there genuinely is no user-visible outcome (e.g. a GC sweep deleting a file), noted explicitly in each spec where that applies.
+
+## Testing (app-shell specific)
+
+- Golden path, expressed as the scenario above with a single online pair, no offline actor.
 - Verify the custom-kind fallback path: a spec containing only standard retrofit-ui kinds still renders correctly through the real `SpecRenderer` fallback, not just through space-chat's local kinds.
-- Attachment loading via the custom protocol handler, including the not-yet-fetched case (per the protocol spec's lazy-fetch policy).
-- Backend-restart recovery: kill and restart the core mid-session, verify the frontend recovers via full resend without a manual reload.
+- Attachment loading via the custom protocol handler, including the not-yet-fetched case (per the protocol spec's lazy-fetch policy) — asserted as a rendered placeholder-then-image transition in the UI, not just an internal fetch-state flag.
+- Backend-restart recovery: kill and restart the core mid-session, verify the frontend recovers via full resend without a manual reload — asserted by the UI still showing correct history after restart, not by inspecting `LiveSpec`'s version counter directly.
 
 ## Open questions carried forward
 
