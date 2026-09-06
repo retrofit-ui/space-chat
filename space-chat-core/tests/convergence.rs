@@ -75,7 +75,12 @@ fn three_members_converge_after_partition_and_reconnect() {
     // All three start in sync.
     sync_pair(&mut alice, &mut alice_bob_a, &mut bob, &mut alice_bob_b);
     sync_pair(&mut bob, &mut bob_carol_b, &mut carol, &mut bob_carol_c);
-    sync_pair(&mut alice, &mut alice_carol_a, &mut carol, &mut alice_carol_c);
+    sync_pair(
+        &mut alice,
+        &mut alice_carol_a,
+        &mut carol,
+        &mut alice_carol_c,
+    );
 
     // Simulate a partition: Alice and Bob send messages Carol doesn't see yet.
     send(&mut alice, alice_id, "from alice during partition");
@@ -84,11 +89,38 @@ fn three_members_converge_after_partition_and_reconnect() {
     // Reconnect: sync every pair until all three match.
     sync_pair(&mut alice, &mut alice_bob_a, &mut bob, &mut alice_bob_b);
     sync_pair(&mut bob, &mut bob_carol_b, &mut carol, &mut bob_carol_c);
-    sync_pair(&mut alice, &mut alice_carol_a, &mut carol, &mut alice_carol_c);
+    sync_pair(
+        &mut alice,
+        &mut alice_carol_a,
+        &mut carol,
+        &mut alice_carol_c,
+    );
     // One more pass, since Carol's new state from Bob may need to reach Alice.
-    sync_pair(&mut alice, &mut alice_carol_a, &mut carol, &mut alice_carol_c);
+    sync_pair(
+        &mut alice,
+        &mut alice_carol_a,
+        &mut carol,
+        &mut alice_carol_c,
+    );
 
     assert_eq!(alice.message_count(), 2);
     assert_eq!(bob.message_count(), 2);
     assert_eq!(carol.message_count(), 2);
+
+    // Matching counts alone would also pass if each peer somehow ended up
+    // with a different set of 2 messages (e.g. a lost message masked by a
+    // duplicate). Since every message lives at its own unique "msg:<uuid>"
+    // key (see the `Segment` doc comment), comparing the sorted key sets
+    // across all three peers is a stronger, still public-API-only check
+    // that they hold *the same* messages, not just the same count --
+    // directly exercising the milestone's "identical conversation state"
+    // exit criterion.
+    let mut alice_keys: Vec<String> = alice.message_keys().collect();
+    let mut bob_keys: Vec<String> = bob.message_keys().collect();
+    let mut carol_keys: Vec<String> = carol.message_keys().collect();
+    alice_keys.sort();
+    bob_keys.sort();
+    carol_keys.sort();
+    assert_eq!(alice_keys, bob_keys);
+    assert_eq!(bob_keys, carol_keys);
 }
