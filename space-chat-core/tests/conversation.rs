@@ -299,3 +299,96 @@ fn three_participants_converge_on_messages_reactions_and_deletes_by_content() {
     assert_eq!(bob_heads, carol_heads);
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 2: attachments, never tested in a multi-peer sync scenario
+// before -- only single-segment save/load round trips.
+// ---------------------------------------------------------------------------
+
+/// Two segments, each created independently (no shared history at all), each
+/// attach a file to a message. After they sync, both peers must read back
+/// identical attachment data (hash/size/mime/wrapped_key), not just a
+/// present-but-possibly-mangled attachment. A third peer who syncs only
+/// through Bob -- never directly with Alice -- must also end up with
+/// Alice's attachment intact, proving it survives relay, not just direct
+/// exchange.
+#[test]
+fn attachments_sync_across_independently_created_segments_and_relay_to_a_third_peer() {
+    let alice_id = DeviceId([1u8; 32]);
+    let bob_id = DeviceId([2u8; 32]);
+
+    let mut alice = Segment::new("space-1", 0);
+    let mut bob = Segment::new("space-1", 0);
+    let mut carol = Segment::new("space-1", 0);
+
+    let alice_attachment = AttachmentRef {
+        hash: [0xAAu8; 32],
+        size: 204_800,
+        mime: "image/png".to_string(),
+        wrapped_key: vec![1, 2, 3, 4, 5, 6, 7, 8],
+    };
+    let bob_attachment = AttachmentRef {
+        hash: [0xBBu8; 32],
+        size: 51_200,
+        mime: "application/pdf".to_string(),
+        wrapped_key: vec![9, 8, 7, 6],
+    };
+
+    alice.append_message(&Message {
+        sender: alice_id,
+        content: "here's the deck".to_string(),
+        attachments: vec![alice_attachment.clone()],
+    });
+    bob.append_message(&Message {
+        sender: bob_id,
+        content: "and here's my summary doc".to_string(),
+        attachments: vec![bob_attachment.clone()],
+    });
+
+    let mut alice_bob_a = sync_state();
+    let mut alice_bob_b = sync_state();
+    sync_pair(&mut alice, &mut alice_bob_a, &mut bob, &mut alice_bob_b);
+
+    assert_eq!(alice.message_count(), 2);
+    assert_eq!(bob.message_count(), 2);
+
+    for content in ["here's the deck", "and here's my summary doc"] {
+        let a_key = find_message_key_by_content(&alice, content);
+        let b_key = find_message_key_by_content(&bob, content);
+        assert_eq!(
+            alice.read_message(&a_key),
+            bob.read_message(&b_key),
+            "attachment data for {content:?} should read back identically on both peers after sync"
+        );
+    }
+
+    // Carol never syncs directly with Alice -- only with Bob.
+    let mut bob_carol_b = sync_state();
+    let mut bob_carol_c = sync_state();
+    sync_pair(&mut bob, &mut bob_carol_b, &mut carol, &mut bob_carol_c);
+
+    assert_eq!(carol.message_count(), 2);
+    let carol_key = find_message_key_by_content(&carol, "here's the deck");
+    let alice_key = find_message_key_by_content(&alice, "here's the deck");
+    assert_eq!(
+        carol.read_message(&carol_key),
+        alice.read_message(&alice_key),
+        "Alice's attachment must reach Carol identically even though they never sync directly"
+    );
+
+    // Explicit field-by-field check as a belt-and-suspenders sanity check
+    // beyond the whole-struct equality above.
+    let carol_msg = carol.read_message(&carol_key).unwrap();
+    assert_eq!(carol_msg.attachments.len(), 1);
+    assert_eq!(carol_msg.attachments[0].hash, alice_attachment.hash);
+    assert_eq!(carol_msg.attachments[0].size, alice_attachment.size);
+    assert_eq!(carol_msg.attachments[0].mime, alice_attachment.mime);
+    assert_eq!(
+        carol_msg.attachments[0].wrapped_key,
+        alice_attachment.wrapped_key
+    );
+
+    let bob_key_for_carol = find_message_key_by_content(&carol, "and here's my summary doc");
+    let bob_msg_for_carol = carol.read_message(&bob_key_for_carol).unwrap();
+    assert_eq!(bob_msg_for_carol.attachments[0].hash, bob_attachment.hash);
+}
+
