@@ -39,6 +39,15 @@ pub fn objid_to_target_string(id: &ObjId) -> String {
 /// rather than a same-value-compared-to-itself tautology (every call site
 /// currently derives both `target` and the field from the same `ObjId` via
 /// [`objid_to_target_string`]).
+///
+/// Caution for future (e.g. wire-protocol) callers: an all-zero-byte input
+/// such as `"00"` or `"0000"` decodes successfully to `ObjId::Root`, not
+/// `None` -- `Some(_)` from this function means "well-formed `ObjId`," not
+/// "well-formed *message or reaction* reference." A root reference is a
+/// real `ObjId`, just never one `Segment::message`/`Segment::reaction`
+/// would hand out, so callers that treat any `Some` as "safe to look up"
+/// should still expect a `None` from those lookups on such input, not rely
+/// on `target_string_to_objid` alone to reject it.
 pub fn target_string_to_objid(s: &str) -> Option<ObjId> {
     if !s.len().is_multiple_of(2) {
         return None;
