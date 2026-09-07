@@ -3,8 +3,9 @@ use crate::projection::{SegmentChange, SegmentCursor};
 use automerge::{
     sync::{self, SyncDoc},
     transaction::Transactable,
-    AutoCommit, AutomergeError, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT,
+    AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT,
 };
+use std::fmt;
 use uuid::Uuid;
 
 /// Prefix marking a top-level ROOT key as a message entry, distinguishing it
@@ -30,7 +31,15 @@ pub fn objid_to_target_string(id: &ObjId) -> String {
 /// wrong-length hex, non-hex characters, or bytes that don't decode as a
 /// valid `ObjId` -- since this handles untrusted, potentially wire-supplied
 /// strings.
-fn target_string_to_objid(s: &str) -> Option<ObjId> {
+///
+/// `pub` so a caller can actually decode a wire-supplied target string
+/// independently of the `target: &ObjId` parameter `append_reaction`/
+/// `apply_delete` also take -- that independent decode path is what makes
+/// `Reaction::target`/`Delete::target`'s defense-in-depth rationale real,
+/// rather than a same-value-compared-to-itself tautology (every call site
+/// currently derives both `target` and the field from the same `ObjId` via
+/// [`objid_to_target_string`]).
+pub fn target_string_to_objid(s: &str) -> Option<ObjId> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -39,6 +48,63 @@ fn target_string_to_objid(s: &str) -> Option<ObjId> {
         .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect::<Option<Vec<u8>>>()?;
     ObjId::try_from(bytes.as_slice()).ok()
+}
+
+/// Error type for [`Segment::append_reaction`] / [`Segment::apply_delete`].
+///
+/// Keeps two genuinely different failure causes distinguishable, which
+/// reusing `automerge::AutomergeError` for both used to conflate: automerge
+/// itself rejecting the operation (e.g. `target` is foreign to this
+/// document -- its actor isn't in this document's actor cache, which can
+/// happen even for a perfectly well-formed request, if the two sides simply
+/// haven't synced that object yet) versus the caller's own `reaction.target`/
+/// `delete.target` field disagreeing with the `target: &ObjId` parameter
+/// passed alongside it (a bug in how the caller constructed the request --
+/// see [`crate::domain::Reaction::target`]'s doc comment for why that field,
+/// and this check, exist).
+#[derive(Debug)]
+pub enum SegmentError {
+    /// Automerge rejected the operation -- e.g. `target` is foreign to this
+    /// document.
+    Automerge(automerge::AutomergeError),
+    /// The wire-facing target string (`reaction.target`/`delete.target`)
+    /// didn't match the `target: &ObjId` parameter passed alongside it,
+    /// once parsed back into an `ObjId` for comparison.
+    TargetMismatch {
+        /// The hex-encoded target string derived from the `target: &ObjId`
+        /// parameter itself, via [`objid_to_target_string`].
+        expected: String,
+        /// The (mismatched) `reaction.target`/`delete.target` field that
+        /// was actually supplied.
+        got: String,
+    },
+}
+
+impl fmt::Display for SegmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SegmentError::Automerge(e) => write!(f, "automerge error: {e}"),
+            SegmentError::TargetMismatch { expected, got } => write!(
+                f,
+                "target field {got:?} does not match the target ObjId parameter (expected {expected:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SegmentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SegmentError::Automerge(e) => Some(e),
+            SegmentError::TargetMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<automerge::AutomergeError> for SegmentError {
+    fn from(e: automerge::AutomergeError) -> Self {
+        SegmentError::Automerge(e)
+    }
 }
 
 /// One epoch's worth of messages, backed by an Automerge document.
@@ -67,7 +133,8 @@ pub struct Segment {
     epoch: u64,
     /// Monotonically increasing count of successful mutating calls
     /// (`append_message`, a successful `append_reaction`, a successful
-    /// `apply_delete`) made on this segment so far. Feeds
+    /// `apply_delete`, or a `receive_sync_message` call that actually
+    /// merges new content) made on this segment so far. Feeds
     /// [`SegmentChange::cursor`] via [`Segment::latest_change`].
     cursor: u64,
 }
@@ -275,21 +342,26 @@ impl Segment {
     /// creation events, which Automerge resolves via last-writer-wins,
     /// silently discarding one side's reaction.
     ///
-    /// Returns `Err` rather than panicking if either `target` is foreign to
-    /// this document (e.g. it came from a `Segment` that has never synced
-    /// with this one -- its actor isn't in this document's actor cache) or
-    /// `reaction.target` doesn't match `target` once parsed back into an
+    /// Returns `Err(SegmentError::Automerge(_))` rather than panicking if
+    /// `target` is foreign to this document (e.g. it came from a `Segment`
+    /// that has never synced with this one -- its actor isn't in this
+    /// document's actor cache), and `Err(SegmentError::TargetMismatch { .. })`
+    /// if `reaction.target` doesn't match `target` once parsed back into an
     /// `ObjId` (see `Reaction::target`'s doc comment for why that check
-    /// exists). `target` is wire-facing: once a later milestone parses it
-    /// out of a network message, a bad value must not be able to crash the
-    /// process.
+    /// exists) -- the two are kept distinguishable because they mean
+    /// different things to a caller. `target` is wire-facing: once a later
+    /// milestone parses it out of a network message, a bad value must not
+    /// be able to crash the process.
     pub fn append_reaction(
         &mut self,
         target: &ObjId,
         reaction: &Reaction,
-    ) -> Result<ObjId, AutomergeError> {
+    ) -> Result<ObjId, SegmentError> {
         if target_string_to_objid(&reaction.target).as_ref() != Some(target) {
-            return Err(AutomergeError::InvalidObjId(reaction.target.clone()));
+            return Err(SegmentError::TargetMismatch {
+                expected: objid_to_target_string(target),
+                got: reaction.target.clone(),
+            });
         }
 
         let key = Self::new_reaction_key();
@@ -334,13 +406,18 @@ impl Segment {
     /// shared ancestor, which is the hazard `append_reaction` and
     /// `append_message` avoid.
     ///
-    /// Returns `Err` rather than panicking if `target` is foreign to this
-    /// document, or if `delete.target` doesn't match `target` once parsed
-    /// back into an `ObjId` -- see [`Segment::append_reaction`]'s doc
-    /// comment for the identical reasoning, which applies here unchanged.
-    pub fn apply_delete(&mut self, target: &ObjId, delete: &Delete) -> Result<(), AutomergeError> {
+    /// Returns `Err(SegmentError::Automerge(_))` rather than panicking if
+    /// `target` is foreign to this document, or
+    /// `Err(SegmentError::TargetMismatch { .. })` if `delete.target` doesn't
+    /// match `target` once parsed back into an `ObjId` -- see
+    /// [`Segment::append_reaction`]'s doc comment for the identical
+    /// reasoning, which applies here unchanged.
+    pub fn apply_delete(&mut self, target: &ObjId, delete: &Delete) -> Result<(), SegmentError> {
         if target_string_to_objid(&delete.target).as_ref() != Some(target) {
-            return Err(AutomergeError::InvalidObjId(delete.target.clone()));
+            return Err(SegmentError::TargetMismatch {
+                expected: objid_to_target_string(target),
+                got: delete.target.clone(),
+            });
         }
 
         self.doc.put(target, "deleted", true)?;
@@ -409,12 +486,30 @@ impl Segment {
 
     /// Applies a sync message received from the peer tracked by `state`,
     /// merging in any changes it carries.
+    ///
+    /// Advances `cursor` (see the `Segment` doc comment on that field) when
+    /// the merge actually changes this document's content, detected by
+    /// comparing `get_heads()` before and after -- a remote peer's sync
+    /// message is exactly as much of a "mutating call" as a local
+    /// `append_message`/`append_reaction`/`apply_delete` from `cursor`'s
+    /// perspective: it changes document content, so anything consuming
+    /// `latest_change()` to dedupe/resume (see
+    /// [`crate::projection::Projection::watermark`]) needs to see `cursor`
+    /// move. A sync message that carries nothing new (e.g. the peer was
+    /// already up to date) leaves the heads unchanged, so `cursor` doesn't
+    /// move either -- no cursor increment should correspond to zero content
+    /// change.
     pub fn receive_sync_message(
         &mut self,
         state: &mut sync::State,
         msg: sync::Message,
     ) -> Result<(), automerge::AutomergeError> {
-        self.doc.sync().receive_sync_message(state, msg)
+        let heads_before = self.doc.get_heads();
+        self.doc.sync().receive_sync_message(state, msg)?;
+        if self.doc.get_heads() != heads_before {
+            self.cursor += 1;
+        }
+        Ok(())
     }
 
     /// The underlying Automerge document's current heads (its
@@ -430,7 +525,8 @@ impl Segment {
     /// Builds a [`SegmentChange`] snapshotting this segment's current state
     /// for a [`crate::projection::Projection`] to `apply`. Callable after
     /// any mutation (`append_message`, a successful `append_reaction`, a
-    /// successful `apply_delete`), each of which advances `cursor` by one.
+    /// successful `apply_delete`, or a `receive_sync_message` call that
+    /// merges new content), each of which advances `cursor` by one.
     ///
     /// Deliberate simplification for this milestone: `bytes` is a full
     /// document snapshot (`self.save()`), not an incremental diff since the
@@ -1240,5 +1336,190 @@ mod tests {
             SegmentCursor(1),
             "a failed append_reaction/apply_delete must not advance the cursor"
         );
+    }
+
+    /// Finding 2 of the Milestone 1 final review, round 2: `cursor` used to
+    /// advance only on local mutating calls (`append_message`,
+    /// `append_reaction`, `apply_delete`), never on `receive_sync_message`
+    /// -- so applying a remote peer's sync message changed document content
+    /// without moving `cursor`, which a `Projection` consuming
+    /// `latest_change()` relies on to dedupe/resume (see
+    /// `Segment::cursor`'s doc comment). This proves `receive_sync_message`
+    /// now advances `cursor` when it actually merges new content: `alice`
+    /// makes zero local mutating calls of her own here, so the only way her
+    /// cursor could move from 0 to 1 is via one of the `receive_sync_message`
+    /// calls `run_sync_to_completion` drives below. (A single
+    /// generate/receive round trip isn't enough to observe this: automerge's
+    /// sync protocol's first message from each side is a handshake/bloom-
+    /// filter probe, not the actual changes -- see
+    /// `run_sync_to_completion`'s doc comment -- so this drives the exchange
+    /// to completion the same way the existing convergence tests do.)
+    #[test]
+    fn receive_sync_message_advances_cursor_when_merging_a_message_from_another_segment() {
+        let mut alice = Segment::new("space-1", 0);
+        let mut bob = Segment::new("space-1", 0);
+        bob.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "from bob".to_string(),
+            attachments: vec![],
+        });
+
+        assert_eq!(
+            alice.latest_change().cursor,
+            SegmentCursor(0),
+            "alice hasn't made any mutating calls of her own yet"
+        );
+
+        let mut alice_state = sync_state();
+        let mut bob_state = sync_state();
+        run_sync_to_completion(&mut alice, &mut alice_state, &mut bob, &mut bob_state);
+
+        assert_eq!(
+            alice.latest_change().cursor,
+            SegmentCursor(1),
+            "receive_sync_message merging new content should advance cursor, \
+             just like a local append_message/append_reaction/apply_delete does"
+        );
+        assert_eq!(alice.message_count(), 1);
+    }
+
+    /// Companion to the test above: a `receive_sync_message` call that
+    /// merges nothing new (the peer was already fully synced, so the
+    /// message it sends carries no new changes) must not advance `cursor`
+    /// -- an unmoved cursor should correspond to unmoved content, mirroring
+    /// how a failed `append_reaction`/`apply_delete` doesn't advance it
+    /// either (see `a_failed_append_reaction_or_apply_delete_does_not_advance_the_cursor`).
+    #[test]
+    fn receive_sync_message_does_not_advance_cursor_when_nothing_new_is_merged() {
+        let mut alice = Segment::new("space-1", 0);
+        let mut bob = Segment::new("space-1", 0);
+        bob.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "from bob".to_string(),
+            attachments: vec![],
+        });
+
+        let mut alice_state = sync_state();
+        let mut bob_state = sync_state();
+        run_sync_to_completion(&mut alice, &mut alice_state, &mut bob, &mut bob_state);
+        let cursor_after_first_sync = alice.latest_change().cursor;
+        assert_eq!(cursor_after_first_sync, SegmentCursor(1));
+
+        // Bob has nothing new, but still constructs a sync message to send
+        // (a bloom-filter probe, not carrying any changes) by resetting his
+        // sync state as if starting a fresh sync round with alice.
+        let mut bob_state = sync_state();
+        if let Some(msg) = bob.generate_sync_message(&mut bob_state) {
+            alice
+                .receive_sync_message(&mut alice_state, msg)
+                .expect("alice should be able to process a no-op sync message");
+        }
+
+        assert_eq!(
+            alice.latest_change().cursor,
+            cursor_after_first_sync,
+            "a receive_sync_message call that merges nothing new must not advance the cursor"
+        );
+    }
+
+    /// Finding 3 of the Milestone 1 final review, round 2:
+    /// `append_reaction`/`apply_delete` used to report a target-field
+    /// mismatch (a caller bug: `reaction.target`/`delete.target` disagreed
+    /// with the `target: &ObjId` parameter) via
+    /// `automerge::AutomergeError::InvalidObjId`, the same error variant a
+    /// genuine Automerge-level rejection (`target` foreign to this
+    /// document) produces -- so a caller couldn't distinguish "your struct
+    /// disagreed with your parameter" from "automerge rejected this object
+    /// reference". This proves the two are now distinguishable via
+    /// `SegmentError`'s variants.
+    #[test]
+    fn segment_error_distinguishes_target_mismatch_from_a_genuine_automerge_error() {
+        let mut segment = Segment::new("space-1", 0);
+        let msg_id = segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "react to me".to_string(),
+            attachments: vec![],
+        });
+        let other_msg_id = segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "not the reaction target".to_string(),
+            attachments: vec![],
+        });
+
+        // Caller bug: the target field names a different local message than
+        // the target: &ObjId parameter.
+        let mismatch_result = segment.append_reaction(
+            &msg_id,
+            &Reaction {
+                target: objid_to_target_string(&other_msg_id),
+                actor: DeviceId([2u8; 32]),
+                emoji: "\u{1F44D}".to_string(),
+            },
+        );
+        assert!(matches!(
+            mismatch_result,
+            Err(SegmentError::TargetMismatch { .. })
+        ));
+
+        // Genuine Automerge-level rejection: target is foreign to this
+        // document entirely (never synced), so its actor isn't in
+        // `segment`'s actor cache -- a different failure cause from the one
+        // above, and the caller can tell them apart.
+        let mut foreign = Segment::new("space-1", 0);
+        let foreign_msg_id = foreign.append_message(&Message {
+            sender: DeviceId([9u8; 32]),
+            content: "foreign message".to_string(),
+            attachments: vec![],
+        });
+        let automerge_result = segment.append_reaction(
+            &foreign_msg_id,
+            &Reaction {
+                target: objid_to_target_string(&foreign_msg_id),
+                actor: DeviceId([2u8; 32]),
+                emoji: "\u{1F44D}".to_string(),
+            },
+        );
+        assert!(matches!(automerge_result, Err(SegmentError::Automerge(_))));
+    }
+
+    /// Same distinction as above, for `apply_delete`.
+    #[test]
+    fn apply_delete_segment_error_distinguishes_target_mismatch_from_a_genuine_automerge_error() {
+        let mut segment = Segment::new("space-1", 0);
+        let msg_id = segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "delete me".to_string(),
+            attachments: vec![],
+        });
+        let other_msg_id = segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "not the delete target".to_string(),
+            attachments: vec![],
+        });
+
+        let mismatch_result = segment.apply_delete(
+            &msg_id,
+            &Delete {
+                target: objid_to_target_string(&other_msg_id),
+            },
+        );
+        assert!(matches!(
+            mismatch_result,
+            Err(SegmentError::TargetMismatch { .. })
+        ));
+
+        let mut foreign = Segment::new("space-1", 0);
+        let foreign_msg_id = foreign.append_message(&Message {
+            sender: DeviceId([9u8; 32]),
+            content: "foreign message".to_string(),
+            attachments: vec![],
+        });
+        let automerge_result = segment.apply_delete(
+            &foreign_msg_id,
+            &Delete {
+                target: objid_to_target_string(&foreign_msg_id),
+            },
+        );
+        assert!(matches!(automerge_result, Err(SegmentError::Automerge(_))));
     }
 }

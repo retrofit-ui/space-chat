@@ -23,9 +23,11 @@ pub struct Message {
 /// reaction -- so why does this field exist too? Resolution (see Finding 6
 /// of the Milestone 1 final review): it's kept, deliberately, as
 /// defense-in-depth, not silently ignored. `Segment::append_reaction`
-/// parses this field back into an `ObjId` and rejects the call
-/// (`AutomergeError::InvalidObjId`) if it doesn't match the `target`
-/// parameter. That catches a real bug class -- a caller resolving the
+/// parses this field back into an `ObjId` (via the `pub`
+/// `segment::target_string_to_objid`, so a caller can do the same
+/// independent decode a wire-supplied target string needs) and rejects the
+/// call (`segment::SegmentError::TargetMismatch`) if it doesn't match the
+/// `target` parameter. That catches a real bug class -- a caller resolving the
 /// wrong local `ObjId` for a wire-supplied target string (e.g. after a
 /// later milestone parses `target` out of a network envelope) -- at the
 /// point of the mistake, rather than silently attaching the reaction to
