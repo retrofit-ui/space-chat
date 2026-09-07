@@ -208,6 +208,22 @@ impl Segment {
             .filter(|key| key.starts_with(MESSAGE_KEY_PREFIX))
     }
 
+    /// Iterates the `"reaction:"`-prefixed keys directly on `target`, in no
+    /// particular order -- mirroring [`Segment::message_keys`]'s pattern one
+    /// level deeper. Includes keys that turn out to be malformed when passed
+    /// to [`Segment::reaction`]; callers that need only well-formed entries
+    /// should filter through `reaction`.
+    ///
+    /// Without this, an external caller has `reaction_count()` but no public
+    /// way to obtain a reaction's key to pass to `reaction()`/
+    /// `read_reaction()` -- `message_keys()` is the message-side equivalent
+    /// that already exists.
+    pub fn reaction_keys(&self, target: &ObjId) -> impl Iterator<Item = String> + '_ {
+        self.doc
+            .keys(target)
+            .filter(|key| key.starts_with(REACTION_KEY_PREFIX))
+    }
+
     /// Appends `msg` as a new map at a fresh unique key under `ROOT` and
     /// returns the Automerge object ID of the newly created map, which
     /// later tasks use as the addressable target for Reactions/Deletes.
@@ -453,22 +469,30 @@ impl Segment {
     /// but they don't belong at load time since a message-shaped entry
     /// could legitimately arrive *after* load, via a later sync message.
     ///
-    /// The loaded segment gets `space_id`/`epoch`/`cursor` fresh from
-    /// `space_id`/`epoch` arguments and a zeroed cursor -- `bytes` alone
-    /// (an Automerge document snapshot) doesn't carry that identity or
-    /// cursor bookkeeping; callers that need to preserve it across a
-    /// save/load round trip must track and re-supply it themselves.
+    /// The loaded segment gets `space_id`/`epoch`/`cursor` fresh from the
+    /// `space_id`/`epoch`/`cursor` arguments -- `bytes` alone (an Automerge
+    /// document snapshot) doesn't carry that identity or cursor bookkeeping.
+    /// A caller that doesn't care about preserving `cursor` across the round
+    /// trip (e.g. a fresh/throwaway load) can pass `0`; a caller that does
+    /// (e.g. one that persisted a [`crate::projection::SegmentChange`]
+    /// alongside `bytes`) should pass that change's `cursor` back in here --
+    /// otherwise the reloaded segment re-emits `SegmentChange` cursor values
+    /// starting over from 1, colliding with values a [`crate::projection::Projection`]
+    /// may have already consumed before `bytes` was saved, defeating the
+    /// point of `cursor` existing at all (see the `Segment` doc comment on
+    /// that field).
     pub fn load(
         bytes: &[u8],
         space_id: impl Into<String>,
         epoch: u64,
+        cursor: u64,
     ) -> Result<Self, automerge::AutomergeError> {
         let doc = AutoCommit::load(bytes)?;
         Ok(Self {
             doc,
             space_id: space_id.into(),
             epoch,
-            cursor: 0,
+            cursor,
         })
     }
 
@@ -570,7 +594,7 @@ mod tests {
         segment.append_message(&msg);
         let bytes = segment.save();
 
-        let loaded = Segment::load(&bytes, "space-1", 0).unwrap();
+        let loaded = Segment::load(&bytes, "space-1", 0, 0).unwrap();
         assert_eq!(loaded.message_count(), 1);
     }
 
@@ -593,7 +617,7 @@ mod tests {
         segment.append_message(&msg);
         let bytes = segment.save();
 
-        let loaded = Segment::load(&bytes, "space-1", 0).unwrap();
+        let loaded = Segment::load(&bytes, "space-1", 0, 0).unwrap();
         assert_eq!(loaded.message_count(), 1);
 
         let key = loaded
@@ -712,10 +736,15 @@ mod tests {
         };
         segment.append_reaction(&msg_id, &reaction).unwrap();
 
+        // Finding 2 of the Milestone 1 final review, round 3: obtain the
+        // reaction's key entirely through the public API -- `reaction_keys`
+        // -- rather than reaching into the private `doc` field, proving the
+        // public API is sufficient on its own (there was previously no
+        // public way to enumerate a target's reaction keys, mirroring what
+        // `message_keys` already provides for messages).
         let key = segment
-            .doc
-            .keys(&msg_id)
-            .find(|k| k.starts_with(REACTION_KEY_PREFIX))
+            .reaction_keys(&msg_id)
+            .next()
             .expect("expected exactly one reaction key");
         let read_back = segment
             .read_reaction(&msg_id, &key)
@@ -858,16 +887,64 @@ mod tests {
         let bytes = doc.save();
 
         let loaded =
-            Segment::load(&bytes, "space-1", 0).expect("a plain Automerge doc should load fine");
+            Segment::load(&bytes, "space-1", 0, 0).expect("a plain Automerge doc should load fine");
         assert_eq!(loaded.message_count(), 0);
     }
 
     #[test]
     fn load_rejects_undecodable_bytes() {
-        let result = Segment::load(b"not an automerge document", "space-1", 0);
+        let result = Segment::load(b"not an automerge document", "space-1", 0, 0);
         assert!(
             result.is_err(),
             "expected Segment::load to reject bytes that aren't a valid Automerge document"
+        );
+    }
+
+    /// Finding 1 of the Milestone 1 final review, round 3: `Segment::load`
+    /// used to hardcode `cursor: 0`, so a reloaded segment re-emitted
+    /// `SegmentChange` cursor values (1, 2, 3...) that collide with values a
+    /// `Projection` may have already consumed before the segment was saved
+    /// -- defeating the point of the cursor fix from the previous review
+    /// round (making `watermark()` trustworthy for dedup). This proves a
+    /// caller that restores a non-zero `cursor` at `load` time gets the
+    /// *next* cursor value on a subsequent mutation, not a restart from 1.
+    #[test]
+    fn load_preserves_a_restored_cursor_across_a_subsequent_mutation() {
+        let mut segment = Segment::new("space-1", 0);
+        segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "one".to_string(),
+            attachments: vec![],
+        });
+        segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "two".to_string(),
+            attachments: vec![],
+        });
+        let change = segment.latest_change();
+        assert_eq!(change.cursor, SegmentCursor(2));
+
+        // Simulate a caller that persisted `change.cursor` alongside
+        // `change.bytes` and is now reloading after a restart.
+        let mut loaded = Segment::load(&change.bytes, "space-1", 0, change.cursor.0)
+            .expect("previously-saved bytes should load fine");
+        assert_eq!(
+            loaded.latest_change().cursor,
+            SegmentCursor(2),
+            "a freshly-loaded segment's cursor should reflect the restored value, \
+             not restart from 0"
+        );
+
+        loaded.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "three".to_string(),
+            attachments: vec![],
+        });
+        assert_eq!(
+            loaded.latest_change().cursor,
+            SegmentCursor(3),
+            "a mutation after a cursor-restoring load should produce the next \
+             cursor value, not restart the sequence from 1"
         );
     }
 

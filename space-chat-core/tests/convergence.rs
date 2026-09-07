@@ -77,7 +77,10 @@ fn three_members_converge_after_partition_and_reconnect() {
 
     // Sanity check on Task 5's sequencer logic in a 3-member context —
     // this is what the protocol spec's membership-change routing depends on.
-    assert_eq!(elect_sequencer(&[alice_id, bob_id, carol_id]), alice_id);
+    assert_eq!(
+        elect_sequencer(&[alice_id, bob_id, carol_id]),
+        Some(alice_id)
+    );
 
     let mut alice = Segment::new("space-1", 0);
     let mut bob = Segment::new("space-1", 0);

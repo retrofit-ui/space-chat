@@ -23,7 +23,9 @@ pub trait Projection {
 mod tests {
     use super::*;
 
-    struct CountingProjection { count: u64 }
+    struct CountingProjection {
+        count: u64,
+    }
 
     impl Projection for CountingProjection {
         fn watermark(&self) -> SegmentCursor {
