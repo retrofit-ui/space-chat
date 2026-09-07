@@ -1599,4 +1599,95 @@ mod tests {
         );
         assert!(matches!(automerge_result, Err(SegmentError::Automerge(_))));
     }
+
+    /// Coverage gap found via `cargo llvm-cov`: [`target_string_to_objid`]'s
+    /// `None`-returning paths were never directly exercised by any existing
+    /// test -- every prior use only ever fed it a well-formed hex string
+    /// (via [`objid_to_target_string`]), so its documented "never panics for
+    /// any malformed input" claim (odd-length hex, non-hex characters, or
+    /// bytes that don't decode as a valid `ObjId`) was unverified. This is a
+    /// `pub` function specifically because it needs to handle
+    /// untrusted/wire-supplied strings independently of `Segment`'s own
+    /// target-parameter checks (see its doc comment), so its malformed-input
+    /// behavior matters on its own.
+    #[test]
+    fn target_string_to_objid_returns_none_for_malformed_input() {
+        // Odd-length hex string: the length check itself.
+        assert!(target_string_to_objid("a").is_none());
+        assert!(target_string_to_objid("abc").is_none());
+
+        // Even length, but contains non-hex characters.
+        assert!(target_string_to_objid("zz").is_none());
+        assert!(target_string_to_objid("gg").is_none());
+
+        // Empty string is even-length (zero hex pairs) and decodes to zero
+        // bytes -- distinct from ROOT's own byte encoding, so this is not a
+        // valid ObjId either.
+        assert!(target_string_to_objid("").is_none());
+    }
+
+    /// Coverage gap found via `cargo llvm-cov`: `SegmentError`'s `Display`
+    /// and `source()` implementations were never directly tested -- prior
+    /// tests only checked the error *variant* via `matches!`, never called
+    /// `.to_string()` or `.source()` on the value. This exercises the
+    /// `TargetMismatch` arm of both.
+    #[test]
+    fn segment_error_target_mismatch_display_and_source() {
+        let err = SegmentError::TargetMismatch {
+            expected: "aa".to_string(),
+            got: "bb".to_string(),
+        };
+
+        let message = err.to_string();
+        assert!(message.contains("aa"), "message was: {message:?}");
+        assert!(message.contains("bb"), "message was: {message:?}");
+
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "a TargetMismatch is a caller-side bug (a mismatched field), not a wrapped \
+             error, so it has no source"
+        );
+    }
+
+    /// Same coverage gap as above, for the `Automerge` arm of `Display` /
+    /// `source()`.
+    #[test]
+    fn segment_error_automerge_variant_display_and_source() {
+        let mut segment = Segment::new("space-1", 0);
+        segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "local message".to_string(),
+            attachments: vec![],
+        });
+
+        let mut foreign = Segment::new("space-1", 0);
+        let foreign_msg_id = foreign.append_message(&Message {
+            sender: DeviceId([9u8; 32]),
+            content: "foreign message".to_string(),
+            attachments: vec![],
+        });
+
+        let err = segment
+            .append_reaction(
+                &foreign_msg_id,
+                &Reaction {
+                    target: objid_to_target_string(&foreign_msg_id),
+                    actor: DeviceId([2u8; 32]),
+                    emoji: "\u{1F44D}".to_string(),
+                },
+            )
+            .expect_err("a foreign ObjId should produce an Err");
+        assert!(matches!(err, SegmentError::Automerge(_)));
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("automerge error:"),
+            "message was: {message:?}"
+        );
+
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "an Automerge-wrapped error should expose the underlying automerge error as its source"
+        );
+    }
 }
