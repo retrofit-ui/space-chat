@@ -392,3 +392,102 @@ fn attachments_sync_across_independently_created_segments_and_relay_to_a_third_p
     assert_eq!(bob_msg_for_carol.attachments[0].hash, bob_attachment.hash);
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 3: concurrent, unsynced delete + reaction on the *same* message,
+// from different peers -- an interaction between two individually-tested
+// mechanisms that's never been tested together.
+// ---------------------------------------------------------------------------
+
+/// Bob deletes a message while Carol -- who hasn't seen Bob's delete --
+/// concurrently reacts to that very same message. Neither has any idea the
+/// other is touching it. Both operations must survive sync: the tombstone
+/// and the reaction are independent fields/objects (see `Segment::apply_delete`'s
+/// doc comment on why deletes are safe even without a unique-key scheme,
+/// and `Segment::append_reaction`'s on why reactions need one), so there's
+/// no reason for one to clobber the other -- but that's never been proven
+/// with both mechanisms firing on the same target at once, from different
+/// peers.
+#[test]
+fn concurrent_delete_and_reaction_on_the_same_message_both_survive_sync() {
+    let alice_id = DeviceId([1u8; 32]);
+    let carol_id = DeviceId([3u8; 32]);
+
+    let mut alice = Segment::new("space-1", 0);
+    let mut bob = Segment::new("space-1", 0);
+    let mut carol = Segment::new("space-1", 0);
+
+    let mut alice_bob_a = sync_state();
+    let mut alice_bob_b = sync_state();
+    let mut bob_carol_b = sync_state();
+    let mut bob_carol_c = sync_state();
+    let mut alice_carol_a = sync_state();
+    let mut alice_carol_c = sync_state();
+
+    send(&mut alice, alice_id, "oops wrong channel, ignore this");
+
+    // Get everyone onto the same message ObjId before anyone touches it.
+    sync_three_to_fixpoint(
+        &mut alice,
+        &mut alice_bob_a,
+        &mut bob,
+        &mut alice_bob_b,
+        &mut bob_carol_b,
+        &mut carol,
+        &mut bob_carol_c,
+        &mut alice_carol_a,
+        &mut alice_carol_c,
+    );
+
+    // Now, with no further sync in between: Bob deletes the message, and
+    // Carol -- who hasn't seen Bob's delete -- reacts to it. Neither has
+    // synced with anyone since the point above.
+    let target_on_bob = find_message_id_by_content(&bob, "oops wrong channel, ignore this");
+    delete(&mut bob, &target_on_bob);
+
+    let target_on_carol = find_message_id_by_content(&carol, "oops wrong channel, ignore this");
+    react(&mut carol, &target_on_carol, carol_id, "\u{1F602}"); // carol: 😂, unaware it's deleted
+
+    // Full mesh reconnect.
+    sync_three_to_fixpoint(
+        &mut alice,
+        &mut alice_bob_a,
+        &mut bob,
+        &mut alice_bob_b,
+        &mut bob_carol_b,
+        &mut carol,
+        &mut bob_carol_c,
+        &mut alice_carol_a,
+        &mut alice_carol_c,
+    );
+
+    // Both concurrent, independently-triggered operations must survive:
+    // the delete tombstone AND the reaction, on every peer.
+    let target_on_alice = find_message_id_by_content(&alice, "oops wrong channel, ignore this");
+    assert!(alice.is_deleted(&target_on_alice));
+    assert!(bob.is_deleted(&target_on_bob));
+    assert!(carol.is_deleted(&target_on_carol));
+
+    assert_eq!(alice.reaction_count(&target_on_alice), 1);
+    assert_eq!(bob.reaction_count(&target_on_bob), 1);
+    assert_eq!(carol.reaction_count(&target_on_carol), 1);
+
+    let alice_reaction_key = alice
+        .reaction_keys(&target_on_alice)
+        .next()
+        .expect("the reaction should have synced to alice");
+    let alice_reaction = alice
+        .read_reaction(&target_on_alice, &alice_reaction_key)
+        .expect("a synced reaction should read back");
+    assert_eq!(alice_reaction.actor, carol_id);
+    assert_eq!(alice_reaction.emoji, "\u{1F602}");
+
+    let mut alice_heads = alice.heads();
+    let mut bob_heads = bob.heads();
+    let mut carol_heads = carol.heads();
+    alice_heads.sort();
+    bob_heads.sort();
+    carol_heads.sort();
+    assert_eq!(alice_heads, bob_heads);
+    assert_eq!(bob_heads, carol_heads);
+}
+
