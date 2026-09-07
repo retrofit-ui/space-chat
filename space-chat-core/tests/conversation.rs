@@ -141,6 +141,46 @@ fn sync_three_to_fixpoint(
     }
 }
 
+/// Generalization of `sync_three_to_fixpoint` to an arbitrary number of
+/// peers: every ordered pair (i, j) gets its own `sync::State`, kept in a
+/// map so pairs can be synced in any order without fighting the borrow
+/// checker over holding two mutable `Segment` borrows and two mutable
+/// `sync::State` borrows at once. Re-runs every pair until a full round
+/// exchanges nothing further -- a genuine mesh-wide fixpoint, not a
+/// hand-picked pass count.
+fn sync_mesh_to_fixpoint(segments: &mut [Segment]) {
+    let n = segments.len();
+    let mut states: HashMap<(usize, usize), automerge::sync::State> = HashMap::new();
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                states.insert((i, j), sync_state());
+            }
+        }
+    }
+
+    loop {
+        let mut progressed = false;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut i_state = states.remove(&(i, j)).unwrap();
+                let mut j_state = states.remove(&(j, i)).unwrap();
+                let (left, right) = segments.split_at_mut(j);
+                let seg_i = &mut left[i];
+                let seg_j = &mut right[0];
+                if sync_pair(seg_i, &mut i_state, seg_j, &mut j_state) {
+                    progressed = true;
+                }
+                states.insert((i, j), i_state);
+                states.insert((j, i), j_state);
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 1: messages + reactions + deletes, richly interleaved, verified
 // by content -- not just counts/heads.
@@ -491,3 +531,101 @@ fn concurrent_delete_and_reaction_on_the_same_message_both_survive_sync() {
     assert_eq!(bob_heads, carol_heads);
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 4: more than 3 participants (5), all creating messages AND
+// reactions fully concurrently before any sync happens at all.
+// ---------------------------------------------------------------------------
+
+/// Five independently-created segments -- no two have ever synced with
+/// anyone -- each send one message and react to their own message, entirely
+/// before any sync happens. This is the highest-concurrency version of the
+/// unique-key design's core claim (see the `Segment` doc comment): N peers
+/// writing to a "shared" `ROOT`/message-map with zero coordination and zero
+/// causal history between them must never collide, at a higher N than the
+/// existing 3-party convergence test exercises.
+#[test]
+fn five_participants_creating_messages_and_reactions_fully_concurrently_converge_after_full_mesh_sync(
+) {
+    let ids: Vec<DeviceId> = (1u8..=5).map(|b| DeviceId([b; 32])).collect();
+    let mut segments: Vec<Segment> = (0..5).map(|_| Segment::new("space-1", 0)).collect();
+
+    let contents = [
+        "message from participant 0",
+        "message from participant 1",
+        "message from participant 2",
+        "message from participant 3",
+        "message from participant 4",
+    ];
+    let emojis = [
+        "\u{1F600}",
+        "\u{1F601}",
+        "\u{1F602}",
+        "\u{1F603}",
+        "\u{1F604}",
+    ];
+
+    for i in 0..5 {
+        let target = send(&mut segments[i], ids[i], contents[i]);
+        react(&mut segments[i], &target, ids[i], emojis[i]);
+    }
+
+    sync_mesh_to_fixpoint(&mut segments);
+
+    // Every peer must have all 5 messages.
+    for seg in &segments {
+        assert_eq!(seg.message_count(), 5);
+    }
+
+    // Every peer must converge on the exact same set of message keys (a
+    // stronger check than count alone -- rules out one peer having a
+    // duplicate masking a lost message).
+    let mut reference_keys: Option<Vec<String>> = None;
+    for seg in &segments {
+        let mut keys: Vec<String> = seg.message_keys().collect();
+        keys.sort();
+        match &reference_keys {
+            None => reference_keys = Some(keys),
+            Some(reference) => assert_eq!(
+                reference, &keys,
+                "every participant should converge on the exact same set of message keys"
+            ),
+        }
+    }
+
+    // Every message must have exactly its one self-reaction on every peer --
+    // proving 5-way concurrent message creation *and* reaction creation
+    // never collided at any of the unique-key sites.
+    for (content, expected_emoji) in contents.iter().zip(emojis.iter()) {
+        for seg in &segments {
+            let key = find_message_key_by_content(seg, content);
+            let id = seg.message(&key).unwrap();
+            assert_eq!(
+                seg.reaction_count(&id),
+                1,
+                "message {content:?} should have exactly one reaction on every peer, no collisions"
+            );
+            let reaction_key = seg.reaction_keys(&id).next().unwrap();
+            let reaction = seg.read_reaction(&id, &reaction_key).unwrap();
+            assert_eq!(&reaction.emoji, expected_emoji);
+        }
+    }
+
+    // Strongest possible convergence proof across all 5: identical
+    // Automerge heads.
+    let mut all_heads: Vec<Vec<automerge::ChangeHash>> = segments
+        .iter_mut()
+        .map(|s| {
+            let mut h = s.heads();
+            h.sort();
+            h
+        })
+        .collect();
+    let reference = all_heads.pop().unwrap();
+    assert!(!reference.is_empty());
+    for heads in all_heads {
+        assert_eq!(
+            heads, reference,
+            "all 5 participants should share identical Automerge heads after full mesh sync"
+        );
+    }
+}
