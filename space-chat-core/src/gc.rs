@@ -37,6 +37,11 @@ pub fn sweep<M: AttachmentMetadataStore, B: AttachmentBlobStore>(
             let elapsed = now.duration_since(first_seen).unwrap_or(Duration::ZERO);
             if elapsed >= grace_window {
                 blobs.delete_attachment(&hash)?;
+                // Forget the metadata row too, not just the blob -- otherwise
+                // this hash lingers in `all_hashes()` forever and every
+                // future sweep re-processes (a harmless but pointless no-op
+                // re-delete of) the same already-gone blob.
+                metadata.forget(hash)?;
                 deleted.push(hash);
             }
         }
@@ -84,6 +89,10 @@ mod tests {
             if let Some(meta) = self.data.get_mut(&hash) {
                 meta.first_seen_unreferenced = None;
             }
+            Ok(())
+        }
+        fn forget(&mut self, hash: [u8; 32]) -> Result<(), StorageError> {
+            self.data.remove(&hash);
             Ok(())
         }
     }
@@ -184,6 +193,39 @@ mod tests {
         assert!(
             deleted.is_empty(),
             "only 31 days have passed since the timer was cleared at t_20_days, not since t0"
+        );
+    }
+
+    /// Proves the fix this amendment made: once a hash is actually deleted,
+    /// its metadata row is gone too -- `all_hashes()` no longer returns it,
+    /// and a subsequent sweep does not re-report it in the returned `Vec`
+    /// (under the original bug, the metadata row lingered forever and every
+    /// future sweep call re-"deleted" -- a no-op -- the same hash again).
+    #[test]
+    fn a_deleted_hash_is_forgotten_not_rediscovered_on_the_next_sweep() {
+        let mut metadata = FakeMetadataStore::default();
+        let mut blobs = FakeBlobStore::default();
+        let hash = [5u8; 32];
+        metadata.record_seen(hash, 10, "a").unwrap();
+        blobs.save_attachment(&hash, b"data").unwrap();
+
+        let t0 = SystemTime::UNIX_EPOCH;
+        sweep(&mut metadata, &mut blobs, &HashSet::new(), t0, GRACE).unwrap();
+
+        let t_31_days = t0 + Duration::from_secs(31 * 24 * 60 * 60);
+        let deleted = sweep(&mut metadata, &mut blobs, &HashSet::new(), t_31_days, GRACE).unwrap();
+        assert_eq!(deleted, vec![hash]);
+        assert!(
+            metadata.get(&hash).unwrap().is_none(),
+            "metadata row must be removed, not just the blob"
+        );
+        assert!(!metadata.all_hashes().unwrap().contains(&hash));
+
+        let t_62_days = t0 + Duration::from_secs(62 * 24 * 60 * 60);
+        let deleted_again = sweep(&mut metadata, &mut blobs, &HashSet::new(), t_62_days, GRACE).unwrap();
+        assert!(
+            deleted_again.is_empty(),
+            "an already-forgotten hash must not be re-reported as deleted on a later sweep"
         );
     }
 }

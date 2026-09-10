@@ -114,6 +114,12 @@ pub trait AttachmentMetadataStore {
     fn mark_unreferenced_if_unset(&mut self, hash: [u8; 32], now: SystemTime) -> Result<(), StorageError>;
     /// Clears `first_seen_unreferenced` (a hash marked live again).
     fn clear_unreferenced(&mut self, hash: [u8; 32]) -> Result<(), StorageError>;
+    /// Removes the metadata row for `hash` entirely. Called by `gc::sweep`
+    /// (Task 6) once a hash's blob is actually deleted, so a dead hash
+    /// doesn't linger in `all_hashes()` forever and get silently
+    /// re-processed (a no-op re-delete) on every future sweep. A no-op if
+    /// `hash` isn't tracked.
+    fn forget(&mut self, hash: [u8; 32]) -> Result<(), StorageError>;
 }
 
 #[cfg(test)]

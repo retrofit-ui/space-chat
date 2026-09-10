@@ -130,6 +130,15 @@ impl AttachmentMetadataStore for RedbAttachmentMetadataStore {
         }
         txn.commit().map_err(redb_err)
     }
+
+    fn forget(&mut self, hash: [u8; 32]) -> Result<(), StorageError> {
+        let txn = self.db.begin_write().map_err(redb_err)?;
+        {
+            let mut table = txn.open_table(ATTACHMENTS).map_err(redb_err)?;
+            table.remove(hash.as_slice()).map_err(redb_err)?;
+        }
+        txn.commit().map_err(redb_err)
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +206,18 @@ mod tests {
         let mut hashes = store.all_hashes().unwrap();
         hashes.sort();
         assert_eq!(hashes, vec![[1u8; 32], [2u8; 32]]);
+    }
+
+    #[test]
+    fn forget_removes_the_metadata_row_entirely() {
+        let (_dir, mut store) = fresh_store();
+        let hash = [6u8; 32];
+        store.record_seen(hash, 10, "a").unwrap();
+
+        store.forget(hash).unwrap();
+
+        assert_eq!(store.get(&hash).unwrap(), None);
+        assert!(!store.all_hashes().unwrap().contains(&hash));
     }
 
     // --- Additional tests, added during self-review of the hand-rolled
