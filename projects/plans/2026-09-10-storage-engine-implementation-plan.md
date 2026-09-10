@@ -14,6 +14,8 @@
 - Three things are irreplaceable and must never be silently regenerated: segment bytes, attachment bytes, MLS state. Everything else (`ListingIndex`, `AttachmentMetadataStore`, `SearchIndex`) is a disposable projection, rebuildable by replaying segments from scratch.
 - `ListingIndex` and `SearchIndex` are watermarked `Projection`s (see Milestone 1's `space_chat_core::projection::Projection` trait) — no shared transaction between `redb` and `tantivy` is attempted; catch-up on startup is watermark-based replay, not cross-store atomicity.
 - Mark-and-sweep GC uses a `first_seen_unreferenced` timestamp per hash, cleared the instant a sweep finds the hash live again; a blob is deleted only once `now - first_seen_unreferenced >= grace_window` (default 30 days, passed as a parameter — not hardcoded — so tests can use a short window). This must be continuous-unreferenced-across-every-sweep, not "seen unreferenced twice."
+- **`SegmentBlobStore` persists `cursor` alongside `bytes`, not just `bytes` alone** (this corrects the plan's original Task 1/2 signatures, amended after Task 2's implementer flagged that cursor can't be reconstructed from segment content — see "Amendment" note on Task 1 and Task 2 below). `Segment::latest_change()`'s `SegmentChange.cursor` is a mutation counter, not something derivable by counting `"msg:"` keys (reactions and deletes also advance it, per `segment.rs`) — the store must carry it explicitly, the same way a caller already has it in hand from `Segment::latest_change()` at save time.
+- **`AttachmentMetadataStore` has a `forget(hash)` method** removing a hash's metadata row entirely (this corrects the plan's original Task 1/6 design, amended after Task 6's implementer flagged that `gc::sweep` deleted blobs but had no way to remove the now-dead metadata row, leaking it forever and re-processing it as a no-op "deletion" on every future sweep — see "Amendment" notes on Task 1 and Task 6 below).
 - **`redb` and `tantivy` API method names in this plan reflect the API as best known at writing time. Before implementing any step that calls into either crate, verify the exact method signatures against `docs.rs` for whichever version gets pinned in `Cargo.toml` — do not treat the code below as gospel over the actual crate docs if they've drifted.** This caveat applies only to external-crate calls; all `space-chat-core`-defined types/signatures in this plan are authoritative for later tasks.
 - Content-addressed attachment files are stored git-object-store style: `attachments/<first 2 hex chars of hash>/<full hex hash>`, mirroring the storage spec's data-placement table.
 - Segment files are stored at `segments/<space_id>/<epoch>.automerge`, per the storage spec's data-placement table.
@@ -21,6 +23,10 @@
 ---
 
 ### Task 1: Storage trait boundaries in `space-chat-core`
+
+> **Amendment (post-Task-2):** `SegmentBlobStore::save_segment`/`load_segment` were originally bytes-only. Task 2's implementer correctly flagged that `catch_up` cannot recover a segment's true `cursor` from its content alone (message count undercounts reactions/deletes), so `save_segment` now takes an explicit `cursor: u64` and `load_segment` returns `(cursor, bytes)`. The code below already reflects the corrected signatures.
+>
+> **Amendment (post-Task-6):** `AttachmentMetadataStore` gained a `forget(hash)` method. Task 6's implementer correctly flagged that `gc::sweep`'s doc comment promised deleting "metadata + blob" but the trait had no way to remove a metadata row — only `clear_unreferenced`/`mark_unreferenced_if_unset`, neither of which deletes anything. Without `forget`, a swept hash's metadata lingers forever, `all_hashes()` keeps returning it, and every future sweep re-"deletes" (no-ops on) the same already-gone blob. The code below already reflects the corrected trait.
 
 **Files:**
 - Create: `space-chat-core/src/storage.rs`
@@ -43,15 +49,15 @@ mod tests {
     // A minimal in-memory fake, used only to prove the trait signatures are
     // usable before any real backend exists.
     struct FakeSegmentBlobStore {
-        data: HashMap<(String, u64), Vec<u8>>,
+        data: HashMap<(String, u64), (u64, Vec<u8>)>,
     }
 
     impl SegmentBlobStore for FakeSegmentBlobStore {
-        fn save_segment(&mut self, space_id: &str, epoch: u64, bytes: &[u8]) -> Result<(), StorageError> {
-            self.data.insert((space_id.to_string(), epoch), bytes.to_vec());
+        fn save_segment(&mut self, space_id: &str, epoch: u64, cursor: u64, bytes: &[u8]) -> Result<(), StorageError> {
+            self.data.insert((space_id.to_string(), epoch), (cursor, bytes.to_vec()));
             Ok(())
         }
-        fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<Vec<u8>>, StorageError> {
+        fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<(u64, Vec<u8>)>, StorageError> {
             Ok(self.data.get(&(space_id.to_string(), epoch)).cloned())
         }
         fn list_epochs(&self, space_id: &str) -> Result<Vec<u64>, StorageError> {
@@ -67,10 +73,10 @@ mod tests {
     }
 
     #[test]
-    fn segment_blob_store_round_trips_bytes() {
+    fn segment_blob_store_round_trips_cursor_and_bytes() {
         let mut store = FakeSegmentBlobStore { data: HashMap::new() };
-        store.save_segment("space-1", 0, b"hello").unwrap();
-        assert_eq!(store.load_segment("space-1", 0).unwrap(), Some(b"hello".to_vec()));
+        store.save_segment("space-1", 0, 3, b"hello").unwrap();
+        assert_eq!(store.load_segment("space-1", 0).unwrap(), Some((3, b"hello".to_vec())));
         assert_eq!(store.load_segment("space-1", 1).unwrap(), None);
         assert_eq!(store.list_epochs("space-1").unwrap(), vec![0]);
     }
@@ -79,7 +85,7 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd space-chat-core && cargo test segment_blob_store_round_trips_bytes`
+Run: `cd space-chat-core && cargo test segment_blob_store_round_trips_cursor_and_bytes`
 Expected: FAIL — `SegmentBlobStore`, `StorageError` not defined.
 
 - [ ] **Step 3: Write the trait boundaries**
@@ -110,10 +116,17 @@ impl std::error::Error for StorageError {}
 
 /// Irreplaceable source-of-truth storage for Automerge segment bytes, one
 /// entry per `(space_id, epoch)`, per the storage spec's data-placement
-/// table (`segments/<space_id>/<epoch>.automerge`).
+/// table (`segments/<space_id>/<epoch>.automerge`). Persists `cursor`
+/// alongside `bytes` — `cursor` is a mutation counter
+/// (`Segment`/`SegmentChange`'s own bookkeeping, from `Segment::latest_change()`),
+/// not something recoverable by inspecting segment content after the fact
+/// (message count alone undercounts reactions/deletes, which also advance
+/// it). A caller always has both in hand together, from the same
+/// `Segment::latest_change()` call that produces a `SegmentChange` to persist.
 pub trait SegmentBlobStore {
-    fn save_segment(&mut self, space_id: &str, epoch: u64, bytes: &[u8]) -> Result<(), StorageError>;
-    fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<Vec<u8>>, StorageError>;
+    fn save_segment(&mut self, space_id: &str, epoch: u64, cursor: u64, bytes: &[u8]) -> Result<(), StorageError>;
+    /// Returns `(cursor, bytes)` for the epoch, or `None` if never saved.
+    fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<(u64, Vec<u8>)>, StorageError>;
     /// All epochs currently persisted for `space_id`, ascending.
     fn list_epochs(&self, space_id: &str) -> Result<Vec<u64>, StorageError>;
 }
@@ -195,6 +208,12 @@ pub trait AttachmentMetadataStore {
     fn mark_unreferenced_if_unset(&mut self, hash: [u8; 32], now: SystemTime) -> Result<(), StorageError>;
     /// Clears `first_seen_unreferenced` (a hash marked live again).
     fn clear_unreferenced(&mut self, hash: [u8; 32]) -> Result<(), StorageError>;
+    /// Removes the metadata row for `hash` entirely. Called by `gc::sweep`
+    /// (Task 6) once a hash's blob is actually deleted, so a dead hash
+    /// doesn't linger in `all_hashes()` forever and get silently
+    /// re-processed (a no-op re-delete) on every future sweep. A no-op if
+    /// `hash` isn't tracked.
+    fn forget(&mut self, hash: [u8; 32]) -> Result<(), StorageError>;
 }
 ```
 
@@ -225,6 +244,8 @@ git commit -m "feat(core): add storage trait boundaries (SegmentBlobStore, Attac
 
 ### Task 2: Watermark-replay driver in `space-chat-core`
 
+> **Amendment:** this task's original code called `store.load_segment` expecting bytes only and hardcoded `Segment::load(&bytes, space_id, epoch, 0)`, which made every replayed `SegmentChange.cursor` come back as `0` — always `<= projection.watermark()`, so nothing ever actually got applied. Fixed below by consuming `SegmentBlobStore`'s corrected `(cursor, bytes)` return (see Task 1's amendment) directly, instead of inferring cursor from content.
+
 **Files:**
 - Create: `space-chat-core/src/replay.rs`
 - Modify: `space-chat-core/src/lib.rs` — add `pub mod replay;`
@@ -248,15 +269,15 @@ mod tests {
     use std::collections::HashMap;
 
     struct FakeSegmentBlobStore {
-        data: HashMap<(String, u64), Vec<u8>>,
+        data: HashMap<(String, u64), (u64, Vec<u8>)>,
     }
 
     impl SegmentBlobStore for FakeSegmentBlobStore {
-        fn save_segment(&mut self, space_id: &str, epoch: u64, bytes: &[u8]) -> Result<(), StorageError> {
-            self.data.insert((space_id.to_string(), epoch), bytes.to_vec());
+        fn save_segment(&mut self, space_id: &str, epoch: u64, cursor: u64, bytes: &[u8]) -> Result<(), StorageError> {
+            self.data.insert((space_id.to_string(), epoch), (cursor, bytes.to_vec()));
             Ok(())
         }
-        fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<Vec<u8>>, StorageError> {
+        fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<(u64, Vec<u8>)>, StorageError> {
             Ok(self.data.get(&(space_id.to_string(), epoch)).cloned())
         }
         fn list_epochs(&self, space_id: &str) -> Result<Vec<u64>, StorageError> {
@@ -297,7 +318,7 @@ mod tests {
             attachments: vec![],
         });
         let change = segment.latest_change();
-        store.save_segment("space-1", 0, &change.bytes).unwrap();
+        store.save_segment("space-1", 0, change.cursor.0, &change.bytes).unwrap();
 
         let mut projection = CountingProjection {
             watermark: SegmentCursor(0),
@@ -319,7 +340,7 @@ mod tests {
             attachments: vec![],
         });
         let change = segment.latest_change();
-        store.save_segment("space-1", 0, &change.bytes).unwrap();
+        store.save_segment("space-1", 0, change.cursor.0, &change.bytes).unwrap();
 
         let mut projection = CountingProjection {
             watermark: SegmentCursor(1), // already caught up
@@ -331,6 +352,50 @@ mod tests {
             projection.applied.len(),
             0,
             "a projection already at the segment's cursor should not be re-applied"
+        );
+    }
+
+    /// Proves the fix this amendment made: a segment containing a reaction
+    /// (not just messages) still replays with the correct cursor. Under the
+    /// old message-count-inference bug, this would have inferred cursor 1
+    /// (one message) instead of the true 2 (append_message + append_reaction),
+    /// silently under-counting.
+    #[test]
+    fn catch_up_replays_the_true_mutation_count_not_just_message_count() {
+        use crate::segment::objid_to_target_string;
+        use crate::domain::Reaction;
+
+        let mut store = FakeSegmentBlobStore { data: HashMap::new() };
+        let mut segment = Segment::new("space-1", 0);
+        let msg_id = segment.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "hello".to_string(),
+            attachments: vec![],
+        });
+        segment
+            .append_reaction(
+                &msg_id,
+                &Reaction {
+                    target: objid_to_target_string(&msg_id),
+                    actor: DeviceId([2u8; 32]),
+                    emoji: "👍".to_string(),
+                },
+            )
+            .unwrap();
+        let change = segment.latest_change();
+        assert_eq!(change.cursor, SegmentCursor(2), "one message + one reaction = cursor 2");
+        store.save_segment("space-1", 0, change.cursor.0, &change.bytes).unwrap();
+
+        let mut projection = CountingProjection {
+            watermark: SegmentCursor(0),
+            applied: vec![],
+        };
+        catch_up(&store, "space-1", &mut projection).unwrap();
+
+        assert_eq!(
+            projection.watermark(),
+            SegmentCursor(2),
+            "watermark must reflect the true cursor (2), not message_count (1)"
         );
     }
 }
@@ -345,7 +410,7 @@ Expected: FAIL — `catch_up` not defined.
 
 ```rust
 // space-chat-core/src/replay.rs (above the tests module)
-use crate::projection::{Projection, ProjectionError, SegmentChange, SegmentCursor};
+use crate::projection::{Projection, ProjectionError, SegmentCursor};
 use crate::segment::Segment;
 use crate::storage::{SegmentBlobStore, StorageError};
 
@@ -369,15 +434,23 @@ pub fn catch_up<P: Projection>(
     projection: &mut P,
 ) -> Result<(), StorageError> {
     for epoch in store.list_epochs(space_id)? {
-        let Some(bytes) = store.load_segment(space_id, epoch)? else {
+        let Some((cursor, bytes)) = store.load_segment(space_id, epoch)? else {
             continue;
         };
-        let mut segment = Segment::load(&bytes, space_id, epoch, 0)
-            .map_err(|e| StorageError::Corrupt(e.to_string()))?;
-        let change = segment.latest_change();
-        if change.cursor <= projection.watermark() {
+        if SegmentCursor(cursor) <= projection.watermark() {
             continue;
         }
+        // Seed the loaded segment's cursor from the persisted value (not 0) --
+        // `Segment::load`'s own doc comment on its `cursor` parameter is
+        // explicit that a caller restoring persisted state must pass the
+        // saved cursor back in, otherwise a subsequent `latest_change()`
+        // re-emits the wrong value. Here we don't even need a subsequent
+        // mutation for this to matter: `latest_change()` below returns
+        // `SegmentCursor(self.cursor)` unchanged, so seeding it correctly is
+        // what makes the value match what was actually persisted.
+        let mut segment = Segment::load(&bytes, space_id, epoch, cursor)
+            .map_err(|e| StorageError::Corrupt(e.to_string()))?;
+        let change = segment.latest_change();
         projection
             .apply(&change)
             .map_err(|e: ProjectionError| StorageError::Corrupt(format!("{e:?}")))?;
@@ -454,17 +527,17 @@ mod tests {
     use space_chat_core::storage::{AttachmentBlobStore, SegmentBlobStore};
 
     #[test]
-    fn segment_store_round_trips_bytes_across_a_fresh_instance() {
+    fn segment_store_round_trips_cursor_and_bytes_across_a_fresh_instance() {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut store = FileSegmentStore::new(dir.path()).unwrap();
-            store.save_segment("space-1", 3, b"epoch three bytes").unwrap();
+            store.save_segment("space-1", 3, 7, b"epoch three bytes").unwrap();
         }
         // Fresh instance, same directory -- proves persistence survives restart.
         let store = FileSegmentStore::new(dir.path()).unwrap();
         assert_eq!(
             store.load_segment("space-1", 3).unwrap(),
-            Some(b"epoch three bytes".to_vec())
+            Some((7, b"epoch three bytes".to_vec()))
         );
         assert_eq!(store.list_epochs("space-1").unwrap(), vec![3]);
     }
@@ -534,14 +607,30 @@ impl FileSegmentStore {
 }
 
 impl SegmentBlobStore for FileSegmentStore {
-    fn save_segment(&mut self, space_id: &str, epoch: u64, bytes: &[u8]) -> Result<(), StorageError> {
+    fn save_segment(&mut self, space_id: &str, epoch: u64, cursor: u64, bytes: &[u8]) -> Result<(), StorageError> {
         fs::create_dir_all(self.space_dir(space_id)).map_err(io_err)?;
-        fs::write(self.epoch_path(space_id, epoch), bytes).map_err(io_err)
+        // File layout: 8-byte BE cursor prefix, then the raw Automerge
+        // segment bytes. `cursor` is bookkeeping this store owns (per the
+        // `SegmentBlobStore` doc comment, it's not recoverable from the
+        // Automerge content itself), so it travels with the file rather than
+        // needing a second file or an index.
+        let mut contents = Vec::with_capacity(8 + bytes.len());
+        contents.extend_from_slice(&cursor.to_be_bytes());
+        contents.extend_from_slice(bytes);
+        fs::write(self.epoch_path(space_id, epoch), contents).map_err(io_err)
     }
 
-    fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<Vec<u8>>, StorageError> {
+    fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<(u64, Vec<u8>)>, StorageError> {
         match fs::read(self.epoch_path(space_id, epoch)) {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(contents) => {
+                if contents.len() < 8 {
+                    return Err(StorageError::Corrupt(format!(
+                        "segment file for {space_id}/{epoch} is shorter than the 8-byte cursor prefix"
+                    )));
+                }
+                let cursor = u64::from_be_bytes(contents[..8].try_into().unwrap());
+                Ok(Some((cursor, contents[8..].to_vec())))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io_err(e)),
         }
@@ -1775,12 +1864,14 @@ fn milestone_1_convergence_still_holds_with_real_persistent_storage() {
     assert_eq!(bob.message_count(), 2);
 
     // Persist each side's converged segment.
-    alice_store.save_segment("space-1", 0, &alice.save()).unwrap();
-    bob_store.save_segment("space-1", 0, &bob.save()).unwrap();
+    let alice_change = alice.latest_change();
+    let bob_change = bob.latest_change();
+    alice_store.save_segment("space-1", 0, alice_change.cursor.0, &alice_change.bytes).unwrap();
+    bob_store.save_segment("space-1", 0, bob_change.cursor.0, &bob_change.bytes).unwrap();
 
     // Reload from disk and confirm the persisted bytes still show both messages.
-    let alice_bytes = alice_store.load_segment("space-1", 0).unwrap().unwrap();
-    let reloaded = Segment::load(&alice_bytes, "space-1", 0, 0).unwrap();
+    let (alice_cursor, alice_bytes) = alice_store.load_segment("space-1", 0).unwrap().unwrap();
+    let reloaded = Segment::load(&alice_bytes, "space-1", 0, alice_cursor).unwrap();
     assert_eq!(reloaded.message_count(), 2);
 }
 
@@ -1803,7 +1894,8 @@ fn listing_index_catches_up_after_a_simulated_restart() {
         content: "two".to_string(),
         attachments: vec![],
     });
-    segment_store.save_segment("space-1", 0, &segment.save()).unwrap();
+    let seed_change = segment.latest_change();
+    segment_store.save_segment("space-1", 0, seed_change.cursor.0, &seed_change.bytes).unwrap();
 
     // "Restart": fresh RedbListingIndex, watermark at 0, must catch up.
     let db = Arc::new(redb::Database::create(dir.path().join("listing.redb")).unwrap());
