@@ -12,3 +12,8 @@ ciborium = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `iroh::test_utils::run_relay_server()` (used by bootstrap.rs's real-network
+# test) is only compiled in when this feature is on. Declared here rather
+# than unconditionally in [dependencies] so production builds of this crate
+# never pull in the relay-server/axum test scaffolding.
+iroh = { version = "1", features = ["test-utils"] }
