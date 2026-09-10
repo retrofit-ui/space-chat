@@ -984,6 +984,8 @@ version = "0.1.0"
 dependencies = [
  "redb",
  "space-chat-core",
+ "space-chat-search-tantivy",
+ "space-chat-storage-files",
  "tempfile",
 ]
 
