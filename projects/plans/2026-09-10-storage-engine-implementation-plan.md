@@ -1058,6 +1058,8 @@ git commit -m "feat(storage-redb): add RedbListingIndex implementing ListingInde
 
 ### Task 5: `space-chat-storage-redb` — `AttachmentMetadataStore`
 
+> **Amendment (post-Task-6):** `AttachmentMetadataStore` gained a `forget(hash)` method after Task 6's review found `gc::sweep` had no way to remove a metadata row once its blob was deleted (see Task 1's and Task 6's amendment notes). `RedbAttachmentMetadataStore` needs a `forget` impl (a plain `table.remove(hash.as_slice())`) to satisfy the trait — added to this task's code below, with a round-trip test.
+
 **Files:**
 - Create: `space-chat-storage-redb/src/attachment_metadata.rs`
 - Modify: `space-chat-storage-redb/src/lib.rs` — add `pub mod attachment_metadata;`
@@ -1136,6 +1138,18 @@ mod tests {
         let mut hashes = store.all_hashes().unwrap();
         hashes.sort();
         assert_eq!(hashes, vec![[1u8; 32], [2u8; 32]]);
+    }
+
+    #[test]
+    fn forget_removes_the_metadata_row_entirely() {
+        let (_dir, mut store) = fresh_store();
+        let hash = [6u8; 32];
+        store.record_seen(hash, 10, "a").unwrap();
+
+        store.forget(hash).unwrap();
+
+        assert_eq!(store.get(&hash).unwrap(), None);
+        assert!(!store.all_hashes().unwrap().contains(&hash));
     }
 }
 ```
@@ -1277,6 +1291,15 @@ impl AttachmentMetadataStore for RedbAttachmentMetadataStore {
         }
         txn.commit().map_err(redb_err)
     }
+
+    fn forget(&mut self, hash: [u8; 32]) -> Result<(), StorageError> {
+        let txn = self.db.begin_write().map_err(redb_err)?;
+        {
+            let mut table = txn.open_table(ATTACHMENTS).map_err(redb_err)?;
+            table.remove(hash.as_slice()).map_err(redb_err)?;
+        }
+        txn.commit().map_err(redb_err)
+    }
 }
 ```
 
@@ -1303,6 +1326,8 @@ git commit -m "feat(storage-redb): add RedbAttachmentMetadataStore"
 ---
 
 ### Task 6: Mark-and-sweep GC, generic over `AttachmentMetadataStore` + `AttachmentBlobStore`
+
+> **Amendment:** this task's original `sweep` deleted the blob but had no way to remove the metadata row (`AttachmentMetadataStore` had no delete method), so a swept hash's metadata lingered in `all_hashes()` forever and got silently re-"deleted" (a no-op re-delete of an already-gone blob) on every future sweep. Fixed by adding `AttachmentMetadataStore::forget` (see Task 1's amendment) and calling it here once a hash is actually deleted. A new test, `a_deleted_hash_is_forgotten_not_rediscovered_on_the_next_sweep`, is added below to close the gap.
 
 **Files:**
 - Create: `space-chat-core/src/gc.rs`
@@ -1357,6 +1382,10 @@ mod tests {
             if let Some(meta) = self.data.get_mut(&hash) {
                 meta.first_seen_unreferenced = None;
             }
+            Ok(())
+        }
+        fn forget(&mut self, hash: [u8; 32]) -> Result<(), StorageError> {
+            self.data.remove(&hash);
             Ok(())
         }
     }
@@ -1459,6 +1488,39 @@ mod tests {
             "only 31 days have passed since the timer was cleared at t_20_days, not since t0"
         );
     }
+
+    /// Proves the fix this amendment made: once a hash is actually deleted,
+    /// its metadata row is gone too -- `all_hashes()` no longer returns it,
+    /// and a subsequent sweep does not re-report it in the returned `Vec`
+    /// (under the original bug, the metadata row lingered forever and every
+    /// future sweep call re-"deleted" -- a no-op -- the same hash again).
+    #[test]
+    fn a_deleted_hash_is_forgotten_not_rediscovered_on_the_next_sweep() {
+        let mut metadata = FakeMetadataStore::default();
+        let mut blobs = FakeBlobStore::default();
+        let hash = [5u8; 32];
+        metadata.record_seen(hash, 10, "a").unwrap();
+        blobs.save_attachment(&hash, b"data").unwrap();
+
+        let t0 = SystemTime::UNIX_EPOCH;
+        sweep(&mut metadata, &mut blobs, &HashSet::new(), t0, GRACE).unwrap();
+
+        let t_31_days = t0 + Duration::from_secs(31 * 24 * 60 * 60);
+        let deleted = sweep(&mut metadata, &mut blobs, &HashSet::new(), t_31_days, GRACE).unwrap();
+        assert_eq!(deleted, vec![hash]);
+        assert!(
+            metadata.get(&hash).unwrap().is_none(),
+            "metadata row must be removed, not just the blob"
+        );
+        assert!(!metadata.all_hashes().unwrap().contains(&hash));
+
+        let t_62_days = t0 + Duration::from_secs(62 * 24 * 60 * 60);
+        let deleted_again = sweep(&mut metadata, &mut blobs, &HashSet::new(), t_62_days, GRACE).unwrap();
+        assert!(
+            deleted_again.is_empty(),
+            "an already-forgotten hash must not be re-reported as deleted on a later sweep"
+        );
+    }
 }
 ```
 
@@ -1510,6 +1572,11 @@ pub fn sweep<M: AttachmentMetadataStore, B: AttachmentBlobStore>(
             let elapsed = now.duration_since(first_seen).unwrap_or(Duration::ZERO);
             if elapsed >= grace_window {
                 blobs.delete_attachment(&hash)?;
+                // Forget the metadata row too, not just the blob -- otherwise
+                // this hash lingers in `all_hashes()` forever and every
+                // future sweep re-processes (a harmless but pointless no-op
+                // re-delete of) the same already-gone blob.
+                metadata.forget(hash)?;
                 deleted.push(hash);
             }
         }
