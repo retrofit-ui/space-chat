@@ -3,8 +3,9 @@ use space_chat_core::storage::{SearchIndex, StorageError};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tantivy::doc;
-use tantivy::schema::{Schema, Value, STORED, STRING, TEXT};
-use tantivy::{Index, IndexWriter, TantivyDocument};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::{IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
+use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 fn tantivy_err(e: impl std::fmt::Display) -> StorageError {
     StorageError::Io(e.to_string())
@@ -54,19 +55,24 @@ impl TantivySearchIndex {
         })
     }
 
-    /// Forces a commit + reader reload so a just-indexed message becomes
-    /// searchable immediately, instead of waiting for tantivy's normal
-    /// near-real-time refresh interval. Test-only: production code accepts
-    /// the near-real-time gap the storage spec explicitly says is fine for
-    /// search (unlike `ListingIndex`, which must be synchronous).
+    /// Flushes the `IndexWriter` so indexed-but-uncommitted messages become
+    /// searchable. This is a real production method, not test-only: nothing
+    /// else in this crate ever calls `IndexWriter::commit`, so a caller
+    /// (Milestone 4's composition root) must invoke this periodically --
+    /// on a timer, or after a batch of `index_message` calls -- for search
+    /// to ever observe new content at all. "Near-real-time" (the storage
+    /// spec's accepted staleness for search, unlike `ListingIndex`'s
+    /// immediate consistency) describes the gap between indexing and the
+    /// next scheduled call to this method, not "commits automatically."
     ///
-    /// Note: `search()` below always builds a brand-new `IndexReader` per
-    /// call (`self.index.reader()`), and a freshly-constructed reader always
-    /// opens the currently-committed segments synchronously (it doesn't wait
-    /// for the `ReloadPolicy::OnCommitWithDelay` background watch to fire) --
-    /// so a plain `writer.commit()` is sufficient here; no separate manual
-    /// `reader.reload()` call is needed for a *new* reader to observe it.
-    pub fn commit_for_test(&mut self) -> Result<(), StorageError> {
+    /// `search()` below always builds a brand-new `IndexReader` per call
+    /// (`self.index.reader()`), and a freshly-constructed reader always
+    /// opens the currently-committed segments synchronously (it doesn't
+    /// wait for the `ReloadPolicy::OnCommitWithDelay` background watch to
+    /// fire) -- so a plain `writer.commit()` is sufficient here; no separate
+    /// manual `reader.reload()` call is needed for a *new* reader to
+    /// observe it.
+    pub fn commit(&mut self) -> Result<(), StorageError> {
         self.writer.commit().map_err(tantivy_err)?;
         Ok(())
     }
@@ -87,23 +93,31 @@ impl SearchIndex for TantivySearchIndex {
     fn search(&self, space_id: &str, query: &str) -> Result<Vec<String>, StorageError> {
         let reader = self.index.reader().map_err(tantivy_err)?;
         let searcher = reader.searcher();
-        let query_parser = tantivy::query::QueryParser::for_index(&self.index, vec![self.content_field]);
+        let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
         let parsed_query = query_parser.parse_query(query).map_err(tantivy_err)?;
 
+        // Amendment: the original version ran `parsed_query` alone through
+        // `TopDocs::with_limit(50)` across the WHOLE (multi-tenant) index,
+        // then filtered by `space_id` only after collecting the top 50
+        // globally-ranked hits. Under real multi-space load with shared
+        // vocabulary, another space's documents could fill that window
+        // before this space's genuine matches were ever seen -- a
+        // completeness bug, not a leak (small adversarial tests didn't hit
+        // the 50-doc window, so they passed anyway). Fixed by pushing the
+        // `space_id` constraint into the query itself via a `BooleanQuery`,
+        // so `TopDocs` only ever ranks documents already scoped to this
+        // space -- no post-hoc filter needed.
+        let space_term = Term::from_field_text(self.space_id_field, space_id);
+        let space_query: Box<dyn Query> = Box::new(TermQuery::new(space_term, IndexRecordOption::Basic));
+        let combined_query = BooleanQuery::new(vec![(Occur::Must, space_query), (Occur::Must, parsed_query)]);
+
         let top_docs = searcher
-            .search(&parsed_query, &tantivy::collector::TopDocs::with_limit(50))
+            .search(&combined_query, &tantivy::collector::TopDocs::with_limit(50))
             .map_err(tantivy_err)?;
 
         let mut results = vec![];
         for (_score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address).map_err(tantivy_err)?;
-            let doc_space_id = doc
-                .get_first(self.space_id_field)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if doc_space_id != space_id {
-                continue;
-            }
             if let Some(key) = doc.get_first(self.message_key_field).and_then(|v| v.as_str()) {
                 results.push(key.to_string());
             }
@@ -140,7 +154,7 @@ mod tests {
         let mut index = TantivySearchIndex::new(dir.path()).unwrap();
 
         index.index_message("space-1", "msg:1", "hello from the search test").unwrap();
-        index.commit_for_test().unwrap(); // near-real-time -- test forces a commit rather than sleeping
+        index.commit().unwrap(); // near-real-time -- test forces a commit rather than sleeping
 
         let results = index.search("space-1", "search").unwrap();
         assert_eq!(results, vec!["msg:1".to_string()]);
@@ -153,7 +167,7 @@ mod tests {
 
         index.index_message("space-1", "msg:1", "shared keyword here").unwrap();
         index.index_message("space-2", "msg:2", "shared keyword here").unwrap();
-        index.commit_for_test().unwrap();
+        index.commit().unwrap();
 
         let results = index.search("space-1", "keyword").unwrap();
         assert_eq!(results, vec!["msg:1".to_string()]);
@@ -176,6 +190,35 @@ mod tests {
         assert_eq!(index.watermark(), SegmentCursor(2));
     }
 
+    /// Regression test for the search-scoping amendment: a space's genuine
+    /// match must not be crowded out of `TopDocs::with_limit(50)` by a large
+    /// number of same-vocabulary documents belonging to a DIFFERENT space.
+    /// Under the original post-hoc-filter design, this scenario risked the
+    /// one relevant `space-1` document never appearing in the (globally
+    /// ranked, then filtered) top-50 window at all once 60 other-space
+    /// documents with identical content compete for the same ranking slots.
+    /// With the space_id constraint pushed into the query itself, `space-1`
+    /// has exactly one matching document in its own scope, so it's always
+    /// found regardless of how many unrelated documents exist elsewhere.
+    #[test]
+    fn a_matching_message_is_found_even_when_outnumbered_by_another_spaces_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = TantivySearchIndex::new(dir.path()).unwrap();
+
+        for i in 0..60 {
+            index
+                .index_message("space-other", &format!("msg:other-{i}"), "the quick brown fox jumps")
+                .unwrap();
+        }
+        index
+            .index_message("space-1", "msg:mine", "the quick brown fox jumps")
+            .unwrap();
+        index.commit().unwrap();
+
+        let results = index.search("space-1", "quick brown fox").unwrap();
+        assert_eq!(results, vec!["msg:mine".to_string()]);
+    }
+
     // Adversarial: same message content/term appears in both spaces, and
     // space-2's message is indexed (and thus has a higher tantivy doc id)
     // *after* space-1's -- guards against a filter that accidentally keys
@@ -195,7 +238,7 @@ mod tests {
         index
             .index_message("space-2", "msg:3", "the quick brown fox jumps again")
             .unwrap();
-        index.commit_for_test().unwrap();
+        index.commit().unwrap();
 
         let space_1_results = index.search("space-1", "quick brown fox").unwrap();
         assert_eq!(space_1_results, vec!["msg:1".to_string()]);
