@@ -637,6 +637,8 @@ git commit -m "feat(storage-files): add flat-file SegmentBlobStore and content-a
 
 ### Task 4: `space-chat-storage-redb` — `ListingIndex`
 
+> **Amendment (post-review):** the original `encode_key` used a `0x00` separator byte between `space_id` and the epoch/seq fields, which is broken -- `space_id` is a `String`/`str` and Rust permits an embedded NUL byte, so a `space_id` like `"a\0"` could produce a key that fell inside `page("a", ...)`'s range scan, leaking entries across spaces. Fixed below by length-prefixing `space_id` (a `u32` BE length field before the bytes) instead of using a separator -- see `encode_key`'s doc comment in Step 4 for why this removes the ambiguity. `page`'s `None`-case upper bound and its silently-dropped-on-error `.filter_map(|res| res.ok())` were fixed in the same pass (see Step 4's `page` code and its inline comments). A new test, `page_never_returns_entries_from_a_different_space_id`, is added below to close the gap that let this through un-caught the first time.
+
 **Files:**
 - Create: `space-chat-storage-redb/Cargo.toml`
 - Create: `space-chat-storage-redb/src/lib.rs`
@@ -726,6 +728,46 @@ mod tests {
         assert_eq!(seqs, vec![2, 1], "page() should return entries strictly before (epoch=0, seq=3), newest-first, limited to 2");
     }
 
+    /// Regression test for the encode_key amendment: a `space_id` containing
+    /// an embedded NUL byte (`"a\0"`) must never leak its entries into
+    /// `page("a", ...)`'s results, and vice versa. Under the original
+    /// separator-based `encode_key`, `"a\0"` at (epoch=5, seq=7) fell inside
+    /// `page("a", None, ...)`'s byte range.
+    #[test]
+    fn page_never_returns_entries_from_a_different_space_id() {
+        let (_dir, mut index) = fresh_index();
+        index
+            .append_entry(ListingEntry {
+                space_id: "a".to_string(),
+                epoch: 0,
+                seq: 0,
+                message_key: "msg:a-0".to_string(),
+            })
+            .unwrap();
+        index
+            .append_entry(ListingEntry {
+                space_id: "a\0".to_string(),
+                epoch: 5,
+                seq: 7,
+                message_key: "msg:a-nul-5-7".to_string(),
+            })
+            .unwrap();
+
+        let page_a = index.page("a", None, 10).unwrap();
+        assert_eq!(
+            page_a.iter().map(|e| e.message_key.clone()).collect::<Vec<_>>(),
+            vec!["msg:a-0".to_string()],
+            "page(\"a\", ...) must not include \"a\\0\"'s entry"
+        );
+
+        let page_a_nul = index.page("a\0", None, 10).unwrap();
+        assert_eq!(
+            page_a_nul.iter().map(|e| e.message_key.clone()).collect::<Vec<_>>(),
+            vec!["msg:a-nul-5-7".to_string()],
+            "page(\"a\\0\", ...) must not include \"a\"'s entry"
+        );
+    }
+
     #[test]
     fn watermark_advances_on_apply_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -780,9 +822,22 @@ fn redb_err(e: impl std::fmt::Display) -> StorageError {
     StorageError::Io(e.to_string())
 }
 
+/// Length-prefixed, not separator-delimited: a fixed-width `u32` BE length
+/// field followed by exactly that many `space_id` bytes, then epoch/seq.
+/// **Amendment:** the original version used a single `0x00` separator byte,
+/// which is broken -- Rust `str`/`String` permits an embedded NUL, so
+/// `space_id = "a\0"` at (epoch=5, seq=7) produced a key that fell inside
+/// `page("a", ...)`'s range scan, leaking one space's entries into another's
+/// results. Length-prefixing removes the ambiguity: two different
+/// `space_id`s either encode a different length (differing in the first 4
+/// bytes, which resolves byte-lexicographic ordering before any content is
+/// compared) or the same length or with genuinely identical content (i.e.
+/// the same `space_id`) -- there is no byte sequence a shorter/longer
+/// `space_id`'s key can produce that falls inside another's range.
 fn encode_key(space_id: &str, epoch: u64, seq: u64) -> Vec<u8> {
-    let mut key = space_id.as_bytes().to_vec();
-    key.push(0); // separator, since space_id is variable-length
+    let space_bytes = space_id.as_bytes();
+    let mut key = (space_bytes.len() as u32).to_be_bytes().to_vec();
+    key.extend_from_slice(space_bytes);
     key.extend_from_slice(&epoch.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
@@ -828,31 +883,34 @@ impl ListingIndex for RedbListingIndex {
         let table = txn.open_table(ENTRIES).map_err(redb_err)?;
 
         let start = encode_key(space_id, 0, 0);
-        let end = match before {
-            Some((epoch, seq)) => encode_key(space_id, epoch, seq),
-            None => {
-                let mut end = space_id.as_bytes().to_vec();
-                end.push(1); // byte after the 0 separator, bounds all epochs/seqs for this space_id
-                end
-            }
-        };
+        // Amendment: previously used a separate, shorter "no upper bound"
+        // key for the `before: None` case, built from `space_id` bytes alone
+        // -- broken along with the old separator-based `encode_key` (see
+        // that function's amendment note). With length-prefixed keys, the
+        // simplest correct upper bound is always a real `encode_key` call:
+        // `before: None` means "up to the maximum possible (epoch, seq)."
+        // This excludes a real entry only in the practically-impossible case
+        // where one exists at exactly `(u64::MAX, u64::MAX)` -- a documented
+        // edge case, not a design fork worth solving for.
+        let (before_epoch, before_seq) = before.unwrap_or((u64::MAX, u64::MAX));
+        let end = encode_key(space_id, before_epoch, before_seq);
 
-        let mut entries: Vec<ListingEntry> = table
-            .range(start.as_slice()..end.as_slice())
-            .map_err(redb_err)?
-            .filter_map(|res| res.ok())
-            .map(|(key, value)| {
-                let key_bytes = key.value();
-                let epoch = u64::from_be_bytes(key_bytes[key_bytes.len() - 16..key_bytes.len() - 8].try_into().unwrap());
-                let seq = u64::from_be_bytes(key_bytes[key_bytes.len() - 8..].try_into().unwrap());
-                ListingEntry {
-                    space_id: space_id.to_string(),
-                    epoch,
-                    seq,
-                    message_key: value.value().to_string(),
-                }
-            })
-            .collect();
+        let mut entries = Vec::new();
+        for result in table.range(start.as_slice()..end.as_slice()).map_err(redb_err)? {
+            // Propagate a decode error instead of silently dropping the
+            // entry (the original version's `.filter_map(|res| res.ok())`
+            // masked corruption rather than reporting it).
+            let (key, value) = result.map_err(redb_err)?;
+            let key_bytes = key.value();
+            let epoch = u64::from_be_bytes(key_bytes[key_bytes.len() - 16..key_bytes.len() - 8].try_into().unwrap());
+            let seq = u64::from_be_bytes(key_bytes[key_bytes.len() - 8..].try_into().unwrap());
+            entries.push(ListingEntry {
+                space_id: space_id.to_string(),
+                epoch,
+                seq,
+                message_key: value.value().to_string(),
+            });
+        }
 
         entries.reverse(); // ascending scan -> newest-first
         entries.truncate(limit);
