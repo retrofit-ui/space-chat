@@ -22,10 +22,17 @@ impl std::error::Error for StorageError {}
 
 /// Irreplaceable source-of-truth storage for Automerge segment bytes, one
 /// entry per `(space_id, epoch)`, per the storage spec's data-placement
-/// table (`segments/<space_id>/<epoch>.automerge`).
+/// table (`segments/<space_id>/<epoch>.automerge`). Persists `cursor`
+/// alongside `bytes` — `cursor` is a mutation counter
+/// (`Segment`/`SegmentChange`'s own bookkeeping, from `Segment::latest_change()`),
+/// not something recoverable by inspecting segment content after the fact
+/// (message count alone undercounts reactions/deletes, which also advance
+/// it). A caller always has both in hand together, from the same
+/// `Segment::latest_change()` call that produces a `SegmentChange` to persist.
 pub trait SegmentBlobStore {
-    fn save_segment(&mut self, space_id: &str, epoch: u64, bytes: &[u8]) -> Result<(), StorageError>;
-    fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<Vec<u8>>, StorageError>;
+    fn save_segment(&mut self, space_id: &str, epoch: u64, cursor: u64, bytes: &[u8]) -> Result<(), StorageError>;
+    /// Returns `(cursor, bytes)` for the epoch, or `None` if never saved.
+    fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<(u64, Vec<u8>)>, StorageError>;
     /// All epochs currently persisted for `space_id`, ascending.
     fn list_epochs(&self, space_id: &str) -> Result<Vec<u64>, StorageError>;
 }
@@ -117,15 +124,15 @@ mod tests {
     // A minimal in-memory fake, used only to prove the trait signatures are
     // usable before any real backend exists.
     struct FakeSegmentBlobStore {
-        data: HashMap<(String, u64), Vec<u8>>,
+        data: HashMap<(String, u64), (u64, Vec<u8>)>,
     }
 
     impl SegmentBlobStore for FakeSegmentBlobStore {
-        fn save_segment(&mut self, space_id: &str, epoch: u64, bytes: &[u8]) -> Result<(), StorageError> {
-            self.data.insert((space_id.to_string(), epoch), bytes.to_vec());
+        fn save_segment(&mut self, space_id: &str, epoch: u64, cursor: u64, bytes: &[u8]) -> Result<(), StorageError> {
+            self.data.insert((space_id.to_string(), epoch), (cursor, bytes.to_vec()));
             Ok(())
         }
-        fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<Vec<u8>>, StorageError> {
+        fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<(u64, Vec<u8>)>, StorageError> {
             Ok(self.data.get(&(space_id.to_string(), epoch)).cloned())
         }
         fn list_epochs(&self, space_id: &str) -> Result<Vec<u64>, StorageError> {
@@ -141,10 +148,10 @@ mod tests {
     }
 
     #[test]
-    fn segment_blob_store_round_trips_bytes() {
+    fn segment_blob_store_round_trips_cursor_and_bytes() {
         let mut store = FakeSegmentBlobStore { data: HashMap::new() };
-        store.save_segment("space-1", 0, b"hello").unwrap();
-        assert_eq!(store.load_segment("space-1", 0).unwrap(), Some(b"hello".to_vec()));
+        store.save_segment("space-1", 0, 3, b"hello").unwrap();
+        assert_eq!(store.load_segment("space-1", 0).unwrap(), Some((3, b"hello".to_vec())));
         assert_eq!(store.load_segment("space-1", 1).unwrap(), None);
         assert_eq!(store.list_epochs("space-1").unwrap(), vec![0]);
     }
