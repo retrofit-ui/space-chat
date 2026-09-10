@@ -8,58 +8,75 @@ use crate::identity::TransportIdentity;
 pub const ALPN: &[u8] = b"space-chat/1";
 
 /// `relay: None` uses `iroh`'s production preset (n0's public relay
-/// network, per this plan's Global Constraints); `relay: Some((map, url))`
-/// overrides it with a specific relay — every test in this plan supplies
-/// `iroh::test_utils::run_relay_server()`'s `(RelayMap, RelayUrl)` here so
-/// tests never touch production infrastructure.
+/// network plus its pkarr/DNS discovery services, per this plan's Global
+/// Constraints).
+///
+/// `relay: Some((map, url))` is **not** a general "bring your own relay,
+/// keep everything else" option — it's specifically for local test relays
+/// started via `iroh::test_utils::run_relay_server()`. Every test in this
+/// plan supplies that function's `(RelayMap, RelayUrl)` here so tests never
+/// touch production infrastructure. Setting it does two things: it swaps
+/// in the given relay in place of n0's, and it also disables production
+/// discovery entirely (no pkarr publish/resolve, no DNS lookup) by
+/// switching the endpoint's base preset from `N0` to `Minimal`. A real
+/// self-hosted relay meant to sit alongside full discovery is not what
+/// this option is for.
 pub struct TransportConfig {
     pub relay: Option<(iroh::RelayMap, iroh::RelayUrl)>,
 }
 
 /// Binds a real `iroh::Endpoint` under `identity`'s keypair, ready to
-/// `connect`/`accept` on `ALPN`.
-///
-/// Adaptations vs. the plan's example (verified against the vendored
-/// `iroh` 1.2.0 source, since the plan's own Global Constraints flagged
-/// these as drafted from memory):
-/// - The preset module lives at `iroh::endpoint::presets`, not
-///   `iroh::presets` — the latter doesn't exist at the crate root.
-/// - `RelayMode::Custom(RelayMap)` matches the plan's guess exactly.
-/// - `EndpointAddr`'s builder methods are `EndpointAddr::new(id)` plus
-///   `.with_relay_url(url)` / `.with_ip_addr(addr)` / `.with_addrs(..)` to
-///   attach addresses to a bare `EndpointId`. `Endpoint::addr()` is a
-///   shortcut that returns the endpoint's current best-known `EndpointAddr`
-///   directly, but this crate's own test below builds one by hand instead
-///   (see that test's comment) rather than using `addr()`.
-/// - Not flagged in the plan, but required for the local relay to work at
-///   all: `iroh::test_utils::run_relay_server()` serves its relay/QUIC
-///   endpoints over a self-signed TLS certificate. Trusting it requires
-///   `.ca_tls_config(CaTlsConfig::insecure_skip_verify())` on the builder
-///   — confirmed by iroh's own relay-backed endpoint tests, which all set
-///   this whenever they hand the builder a custom `RelayMap`. Without it,
-///   the endpoint can't complete TLS with the test relay and any path that
-///   depends on relay signaling silently fails.
-///   `CaTlsConfig::insecure_skip_verify` itself only exists when `iroh`'s
-///   own `test-utils` feature is on (it's a deliberately test-only escape
-///   hatch), which this crate only enables as a dev-dependency — so the
-///   call is behind `#[cfg(test)]` below. That also happens to be the
-///   right behavior, not just a compile-time workaround: a real custom
-///   relay (as opposed to this plan's local test relay) would have a
-///   proper certificate and should go through normal CA verification, so
-///   skipping it should never happen outside this crate's own tests.
-/// - Bigger deviation, found empirically: the plan's example builds on
-///   `presets::N0` unconditionally and only swaps `relay_mode` when a
-///   custom relay is given. `presets::N0` unconditionally also wires up
-///   `PkarrPublisher`/`DnsAddressLookup` pointed at n0's *production* DNS
-///   infrastructure — swapping only the relay leaves those production
-///   network calls active, which contradicts this module's own doc
-///   ("optionally pointed at a local test relay instead of production
-///   relay/discovery defaults") and, in a network-restricted environment,
-///   made the two-endpoint test above hang until QUIC's idle timeout (~45s)
-///   before failing. So `relay: Some(..)` builds on `presets::Minimal`
-///   instead (crypto provider only, no discovery, no relay) and adds just
-///   the custom relay + CA override; `relay: None` keeps the full `N0`
-///   preset for real production use.
+/// `connect`/`accept` on `ALPN`. `config.relay: None` uses the full
+/// production preset; `Some(..)` is for local test relays only — see
+/// `TransportConfig`'s doc comment.
+//
+// Adaptations vs. the plan's example (verified against the vendored `iroh`
+// 1.2.0 source, since the plan's own Global Constraints flagged these as
+// drafted from memory):
+// - The preset module lives at `iroh::endpoint::presets`, not
+//   `iroh::presets` — the latter doesn't exist at the crate root.
+// - `RelayMode::Custom(RelayMap)` matches the plan's guess exactly.
+// - `EndpointAddr`'s builder methods are `EndpointAddr::new(id)` plus
+//   `.with_relay_url(url)` / `.with_ip_addr(addr)` / `.with_addrs(..)` to
+//   attach addresses to a bare `EndpointId`. `Endpoint::addr()` is a
+//   shortcut that returns the endpoint's current best-known `EndpointAddr`
+//   directly, but this crate's own test below builds one by hand instead
+//   (see that test's comment) rather than using `addr()`.
+// - Not flagged in the plan, but required for the local relay to work at
+//   all: `iroh::test_utils::run_relay_server()` serves its relay/QUIC
+//   endpoints over a self-signed TLS certificate. Trusting it requires
+//   `.ca_tls_config(CaTlsConfig::insecure_skip_verify())` on the builder —
+//   confirmed by iroh's own relay-backed endpoint tests, which all set this
+//   whenever they hand the builder a custom `RelayMap`. Without it, the
+//   endpoint can't complete TLS with the test relay and any path that
+//   depends on relay signaling silently fails.
+//   `CaTlsConfig::insecure_skip_verify` itself only exists when `iroh`'s
+//   own `test-utils` feature is on (it's a deliberately test-only escape
+//   hatch), which this crate forwards as its own `test-utils` feature and
+//   enables on itself as a dev-dependency — so the call is behind
+//   `#[cfg(any(test, feature = "test-utils"))]` below, not plain
+//   `#[cfg(test)]`: `cfg(test)` is only true while compiling this crate's
+//   *own* `src/`-based unit tests, but integration tests under `tests/`
+//   (and any other crate's tests that exercise this one) compile this
+//   crate as an ordinary dependency with `cfg(test)` false — the
+//   `test-utils` feature is what actually turns this on for those. That
+//   also happens to be the right behavior, not just a compile-time
+//   workaround: a real custom relay (as opposed to this plan's local test
+//   relay) would have a proper certificate and should go through normal CA
+//   verification, so skipping it should never happen outside tests.
+// - Bigger deviation, found empirically: the plan's example builds on
+//   `presets::N0` unconditionally and only swaps `relay_mode` when a custom
+//   relay is given. `presets::N0` unconditionally also wires up
+//   `PkarrPublisher`/`DnsAddressLookup` pointed at n0's *production* DNS
+//   infrastructure — swapping only the relay leaves those production
+//   network calls active, which contradicts this module's own doc
+//   ("optionally pointed at a local test relay instead of production
+//   relay/discovery defaults") and, in a network-restricted environment,
+//   made the two-endpoint test above hang until QUIC's idle timeout (~45s)
+//   before failing. So `relay: Some(..)` builds on `presets::Minimal`
+//   instead (crypto provider only, no discovery, no relay) and adds just
+//   the custom relay + CA override; `relay: None` keeps the full `N0`
+//   preset for real production use.
 pub async fn bind_endpoint(
     identity: &TransportIdentity,
     config: TransportConfig,
@@ -68,7 +85,7 @@ pub async fn bind_endpoint(
         Some((relay_map, _relay_url)) => {
             let builder = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .relay_mode(iroh::RelayMode::Custom(relay_map));
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             let builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
             builder
         }

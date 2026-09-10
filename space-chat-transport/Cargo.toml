@@ -12,8 +12,20 @@ ciborium = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-# `iroh::test_utils::run_relay_server()` (used by bootstrap.rs's real-network
-# test) is only compiled in when this feature is on. Declared here rather
-# than unconditionally in [dependencies] so production builds of this crate
-# never pull in the relay-server/axum test scaffolding.
-iroh = { version = "1", features = ["test-utils"] }
+# Dev-dependency on itself, with `test-utils` enabled: this is the standard
+# pattern for "this feature should be on whenever any test target in this
+# crate builds — unit tests in `src/`, integration tests in `tests/` — but
+# never for downstream consumers or production builds." Cargo unifies
+# features for a single package across a build graph, so enabling
+# `test-utils` here turns it on for the library itself whenever a test
+# binary (which depends on both the lib and, transitively, this dev-dep) is
+# being compiled, without it ever being on for a plain `cargo build`.
+space-chat-transport = { path = ".", features = ["test-utils"] }
+
+[features]
+# Forwards to `iroh`'s own `test-utils` feature, which gates
+# `iroh::test_utils::run_relay_server()` and
+# `iroh::tls::CaTlsConfig::insecure_skip_verify()` — both used by
+# bootstrap.rs's real-network test. Never enabled in production; see the
+# [dev-dependencies] entry above for how this crate's own tests turn it on.
+test-utils = ["iroh/test-utils"]

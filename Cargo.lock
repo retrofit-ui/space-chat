@@ -3796,6 +3796,7 @@ dependencies = [
  "iroh",
  "serde",
  "space-chat-core",
+ "space-chat-transport",
  "tempfile",
  "tokio",
 ]
