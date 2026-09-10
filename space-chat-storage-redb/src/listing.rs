@@ -7,11 +7,14 @@ use std::sync::Arc;
 // range scan gives ascending (epoch, seq) order per space_id for free.
 // Value: message_key.
 const ENTRIES: TableDefinition<&[u8], &str> = TableDefinition::new("listing_entries");
-// Single-row table holding the watermark cursor, so it survives a reopen --
-// per the storage spec, ListingIndex must compare its watermark against
-// what's on disk at startup, which requires the watermark itself to be
-// persisted, not held only in memory.
-const WATERMARK: TableDefinition<&str, u64> = TableDefinition::new("listing_watermark");
+// Keyed by (space_id, epoch) -- see `Projection::watermark`'s doc comment for
+// why a single shared row is wrong (this table originally used one fixed
+// "watermark" string key; fixed as part of the Milestone 2 final
+// whole-branch review, which found `catch_up` silently skipped every epoch
+// after the first as a result). Persisted (not held only in memory) so it
+// survives a reopen -- per the storage spec, ListingIndex must compare its
+// watermark against what's on disk at startup.
+const WATERMARK: TableDefinition<&[u8], u64> = TableDefinition::new("listing_watermark");
 
 fn redb_err(e: impl std::fmt::Display) -> StorageError {
     StorageError::Io(e.to_string())
@@ -35,6 +38,16 @@ fn encode_key(space_id: &str, epoch: u64, seq: u64) -> Vec<u8> {
     key.extend_from_slice(space_bytes);
     key.extend_from_slice(&epoch.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// Same length-prefixing rationale as `encode_key`, one field shorter (no
+/// `seq` -- a watermark is per-epoch, not per-entry).
+fn encode_watermark_key(space_id: &str, epoch: u64) -> Vec<u8> {
+    let space_bytes = space_id.as_bytes();
+    let mut key = (space_bytes.len() as u32).to_be_bytes().to_vec();
+    key.extend_from_slice(space_bytes);
+    key.extend_from_slice(&epoch.to_be_bytes());
     key
 }
 
@@ -90,8 +103,22 @@ impl ListingIndex for RedbListingIndex {
         let (before_epoch, before_seq) = before.unwrap_or((u64::MAX, u64::MAX));
         let end = encode_key(space_id, before_epoch, before_seq);
 
+        // `.rev().take(limit)` instead of collecting the whole `[start, end)`
+        // range and truncating afterward -- the original version allocated
+        // one `ListingEntry` per entry in the ENTIRE space before returning
+        // `limit` of them (found in the Milestone 2 final whole-branch
+        // review: `page(space, None, 50)` on a space with a long history
+        // would materialize its entire backlog just to return the newest
+        // 50). redb's `Range` implements `DoubleEndedIterator`, so reversing
+        // the iterator itself (not a `Vec` built from it) lets `.take(limit)`
+        // stop scanning as soon as it has enough.
         let mut entries = Vec::new();
-        for result in table.range(start.as_slice()..end.as_slice()).map_err(redb_err)? {
+        for result in table
+            .range(start.as_slice()..end.as_slice())
+            .map_err(redb_err)?
+            .rev()
+            .take(limit)
+        {
             // Propagate a decode error instead of silently dropping the
             // entry (the original version's `.filter_map(|res| res.ok())`
             // masked corruption rather than reporting it).
@@ -107,19 +134,18 @@ impl ListingIndex for RedbListingIndex {
             });
         }
 
-        entries.reverse(); // ascending scan -> newest-first
-        entries.truncate(limit);
-        Ok(entries)
+        Ok(entries) // already newest-first: the range scan is ascending, reversed above
     }
 }
 
 impl Projection for RedbListingIndex {
-    fn watermark(&self) -> SegmentCursor {
+    fn watermark(&self, space_id: &str, epoch: u64) -> SegmentCursor {
+        let key = encode_watermark_key(space_id, epoch);
         let txn = self.db.begin_read().expect("redb read transaction should not fail");
         let table = txn
             .open_table(WATERMARK)
             .expect("watermark table is created in RedbListingIndex::new");
-        SegmentCursor(table.get("watermark").ok().flatten().map(|v| v.value()).unwrap_or(0))
+        SegmentCursor(table.get(key.as_slice()).ok().flatten().map(|v| v.value()).unwrap_or(0))
     }
 
     fn apply(&mut self, change: &SegmentChange) -> Result<(), ProjectionError> {
@@ -133,13 +159,14 @@ impl Projection for RedbListingIndex {
         // decode Automerge bytes itself. This keeps `space-chat-storage-redb`
         // free of an `automerge` dependency, per the storage spec's crate
         // layout.
+        let key = encode_watermark_key(&change.space_id, change.epoch);
         let txn = self.db.begin_write().map_err(|e| ProjectionError::ApplyFailed(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(WATERMARK)
                 .map_err(|e| ProjectionError::ApplyFailed(e.to_string()))?;
             table
-                .insert("watermark", change.cursor.0)
+                .insert(key.as_slice(), change.cursor.0)
                 .map_err(|e| ProjectionError::ApplyFailed(e.to_string()))?;
         }
         txn.commit().map_err(|e| ProjectionError::ApplyFailed(e.to_string()))?;
@@ -246,7 +273,7 @@ mod tests {
         {
             let db = Arc::new(redb::Database::create(&db_path).unwrap());
             let mut index = RedbListingIndex::new(db).unwrap();
-            assert_eq!(index.watermark(), SegmentCursor(0));
+            assert_eq!(index.watermark("space-1", 0), SegmentCursor(0));
             index
                 .apply(&SegmentChange {
                     space_id: "space-1".to_string(),
@@ -255,11 +282,59 @@ mod tests {
                     bytes: vec![],
                 })
                 .unwrap();
-            assert_eq!(index.watermark(), SegmentCursor(5));
+            assert_eq!(index.watermark("space-1", 0), SegmentCursor(5));
         }
         // Reopen against the same file -- watermark must persist, not reset.
         let db = Arc::new(redb::Database::open(&db_path).unwrap());
         let index = RedbListingIndex::new(db).unwrap();
-        assert_eq!(index.watermark(), SegmentCursor(5));
+        assert_eq!(index.watermark("space-1", 0), SegmentCursor(5));
+    }
+
+    /// Regression test for the Milestone 2 final whole-branch review: a
+    /// single shared watermark row conflated every space and epoch that
+    /// shared this `RedbListingIndex` instance. Two different (space_id,
+    /// epoch) pairs must track independently, including a case where the
+    /// second-applied cursor is numerically LOWER than the first.
+    #[test]
+    fn watermark_is_tracked_independently_per_space_and_epoch() {
+        let (_dir, mut index) = fresh_index();
+
+        index
+            .apply(&SegmentChange {
+                space_id: "space-1".to_string(),
+                epoch: 0,
+                cursor: SegmentCursor(10),
+                bytes: vec![],
+            })
+            .unwrap();
+        index
+            .apply(&SegmentChange {
+                space_id: "space-1".to_string(),
+                epoch: 1,
+                cursor: SegmentCursor(3),
+                bytes: vec![],
+            })
+            .unwrap();
+        index
+            .apply(&SegmentChange {
+                space_id: "space-2".to_string(),
+                epoch: 0,
+                cursor: SegmentCursor(7),
+                bytes: vec![],
+            })
+            .unwrap();
+
+        assert_eq!(index.watermark("space-1", 0), SegmentCursor(10));
+        assert_eq!(
+            index.watermark("space-1", 1),
+            SegmentCursor(3),
+            "epoch 1's watermark must not be conflated with epoch 0's, even though it's numerically lower"
+        );
+        assert_eq!(index.watermark("space-2", 0), SegmentCursor(7));
+        assert_eq!(
+            index.watermark("space-2", 1),
+            SegmentCursor(0),
+            "an untouched (space_id, epoch) pair must read as 0"
+        );
     }
 }

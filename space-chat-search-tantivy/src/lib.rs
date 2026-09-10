@@ -1,7 +1,7 @@
 use space_chat_core::projection::{Projection, ProjectionError, SegmentChange, SegmentCursor};
 use space_chat_core::storage::{SearchIndex, StorageError};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tantivy::doc;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
@@ -21,12 +21,14 @@ pub struct TantivySearchIndex {
     // to disk. Per the storage spec's error-handling section, a lost/corrupt
     // derived index (this one included) is recoverable by a full replay from
     // segments -- a startup-time full rebuild here is an acceptable
-    // consequence of that same tradeoff, not a bug, so persisting this
-    // counter isn't required for correctness. Task 8's kill-and-restart test
-    // exercises exactly this path for `ListingIndex` (which does persist its
-    // watermark, since it's the immediately-consistent primary view); a
-    // `SearchIndex` restart in this milestone always replays from cursor 0.
-    watermark: AtomicU64,
+    // consequence of that same tradeoff PROVIDED replay is idempotent, which
+    // `index_message` below now guarantees (see its own doc comment; this
+    // was flagged as a real gap by the Milestone 2 final whole-branch
+    // review when the watermark was in-memory-only but re-indexing was NOT
+    // idempotent, which would have duplicated every message on every
+    // restart). Keyed by (space_id, epoch), not a single scalar -- see
+    // `Projection::watermark`'s doc comment for why.
+    watermarks: HashMap<(String, u64), u64>,
 }
 
 impl TantivySearchIndex {
@@ -51,7 +53,7 @@ impl TantivySearchIndex {
             space_id_field,
             message_key_field,
             content_field,
-            watermark: AtomicU64::new(0),
+            watermarks: HashMap::new(),
         })
     }
 
@@ -80,6 +82,18 @@ impl TantivySearchIndex {
 
 impl SearchIndex for TantivySearchIndex {
     fn index_message(&mut self, space_id: &str, message_key: &str, content: &str) -> Result<(), StorageError> {
+        // Amendment (Milestone 2 final whole-branch review): tantivy has no
+        // upsert -- re-indexing the same `message_key` without deleting the
+        // old document first adds a SECOND document. Combined with this
+        // index's in-memory-only watermark, every restart used to replay
+        // from cursor 0 and re-index every message, duplicating the entire
+        // index on every restart. Deleting any existing document for this
+        // key first makes re-indexing idempotent regardless of why it
+        // happens (a genuine edit -- not currently possible per the
+        // protocol spec's immutable-message design, but harmless to handle
+        // -- or a replay).
+        let term = Term::from_field_text(self.message_key_field, message_key);
+        self.writer.delete_term(term);
         self.writer
             .add_document(doc!(
                 self.space_id_field => space_id,
@@ -127,8 +141,13 @@ impl SearchIndex for TantivySearchIndex {
 }
 
 impl Projection for TantivySearchIndex {
-    fn watermark(&self) -> SegmentCursor {
-        SegmentCursor(self.watermark.load(Ordering::SeqCst))
+    fn watermark(&self, space_id: &str, epoch: u64) -> SegmentCursor {
+        SegmentCursor(
+            *self
+                .watermarks
+                .get(&(space_id.to_string(), epoch))
+                .unwrap_or(&0),
+        )
     }
 
     fn apply(&mut self, change: &SegmentChange) -> Result<(), ProjectionError> {
@@ -137,7 +156,8 @@ impl Projection for TantivySearchIndex {
         // is the composition root's job (Task 8's integration test, and
         // later space-chat-app), not this crate's -- keeps
         // space-chat-search-tantivy free of an `automerge` dependency.
-        self.watermark.store(change.cursor.0, Ordering::SeqCst);
+        self.watermarks
+            .insert((change.space_id.clone(), change.epoch), change.cursor.0);
         Ok(())
     }
 }
@@ -177,7 +197,7 @@ mod tests {
     fn watermark_starts_at_zero_and_advances_on_apply() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = TantivySearchIndex::new(dir.path()).unwrap();
-        assert_eq!(index.watermark(), SegmentCursor(0));
+        assert_eq!(index.watermark("space-1", 0), SegmentCursor(0));
 
         index
             .apply(&SegmentChange {
@@ -187,7 +207,30 @@ mod tests {
                 bytes: vec![],
             })
             .unwrap();
-        assert_eq!(index.watermark(), SegmentCursor(2));
+        assert_eq!(index.watermark("space-1", 0), SegmentCursor(2));
+    }
+
+    /// Regression test for the Milestone 2 final whole-branch review:
+    /// `index_message` used to have no upsert semantics -- re-indexing the
+    /// same `message_key` (e.g. from a replay after a restart, since this
+    /// index's watermark is in-memory-only) added a second document,
+    /// duplicating search results and growing the index unboundedly.
+    #[test]
+    fn reindexing_the_same_message_key_does_not_duplicate_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = TantivySearchIndex::new(dir.path()).unwrap();
+
+        index.index_message("space-1", "msg:1", "original content").unwrap();
+        index.commit().unwrap();
+        index.index_message("space-1", "msg:1", "original content").unwrap(); // simulates a replay
+        index.commit().unwrap();
+
+        let results = index.search("space-1", "original").unwrap();
+        assert_eq!(
+            results,
+            vec!["msg:1".to_string()],
+            "re-indexing the same message_key must not duplicate it"
+        );
     }
 
     /// Regression test for the search-scoping amendment: a space's genuine

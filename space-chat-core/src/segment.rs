@@ -1318,7 +1318,7 @@ mod tests {
         }
 
         impl Projection for CountingProjection {
-            fn watermark(&self) -> SegmentCursor {
+            fn watermark(&self, _space_id: &str, _epoch: u64) -> SegmentCursor {
                 self.watermark
             }
             fn apply(&mut self, change: &SegmentChange) -> Result<(), ProjectionError> {
@@ -1343,7 +1343,7 @@ mod tests {
             watermark: SegmentCursor(0),
         };
         projection.apply(&change).unwrap();
-        assert_eq!(projection.watermark(), SegmentCursor(1));
+        assert_eq!(projection.watermark("space-42", 3), SegmentCursor(1));
     }
 
     #[test]

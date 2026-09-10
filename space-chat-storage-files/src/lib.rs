@@ -6,6 +6,30 @@ fn io_err(e: std::io::Error) -> StorageError {
     StorageError::Io(e.to_string())
 }
 
+/// Amendment (Milestone 2 final whole-branch review): `space_id` used to
+/// flow straight into `PathBuf::join` unvalidated. `space_id` may originate
+/// from a remote invite in this p2p app, so an unvalidated `"../../etc"` or
+/// a path separator inside it is a real path-traversal / directory-collision
+/// risk (structurally the same bug class as the `RedbListingIndex`
+/// key-encoding leak found earlier in this milestone: an untrusted string
+/// used directly as a structured key/path, without a length-prefix or
+/// equivalent unambiguous encoding). Rejects anything that isn't safe to use
+/// as a single path component.
+fn validate_space_id(space_id: &str) -> Result<(), StorageError> {
+    if space_id.is_empty()
+        || space_id == "."
+        || space_id == ".."
+        || space_id.contains('/')
+        || space_id.contains('\\')
+        || space_id.contains('\0')
+    {
+        return Err(StorageError::Corrupt(format!(
+            "space_id {space_id:?} is not safe to use as a filesystem path component"
+        )));
+    }
+    Ok(())
+}
+
 /// `SegmentBlobStore` at `<root>/segments/<space_id>/<epoch>.automerge`, per
 /// the storage spec's data-placement table.
 pub struct FileSegmentStore {
@@ -19,18 +43,19 @@ impl FileSegmentStore {
         Ok(Self { root })
     }
 
-    fn space_dir(&self, space_id: &str) -> PathBuf {
-        self.root.join("segments").join(space_id)
+    fn space_dir(&self, space_id: &str) -> Result<PathBuf, StorageError> {
+        validate_space_id(space_id)?;
+        Ok(self.root.join("segments").join(space_id))
     }
 
-    fn epoch_path(&self, space_id: &str, epoch: u64) -> PathBuf {
-        self.space_dir(space_id).join(format!("{epoch}.automerge"))
+    fn epoch_path(&self, space_id: &str, epoch: u64) -> Result<PathBuf, StorageError> {
+        Ok(self.space_dir(space_id)?.join(format!("{epoch}.automerge")))
     }
 }
 
 impl SegmentBlobStore for FileSegmentStore {
     fn save_segment(&mut self, space_id: &str, epoch: u64, cursor: u64, bytes: &[u8]) -> Result<(), StorageError> {
-        fs::create_dir_all(self.space_dir(space_id)).map_err(io_err)?;
+        fs::create_dir_all(self.space_dir(space_id)?).map_err(io_err)?;
         // File layout: 8-byte BE cursor prefix, then the raw Automerge
         // segment bytes. `cursor` is bookkeeping this store owns (per the
         // `SegmentBlobStore` doc comment, it's not recoverable from the
@@ -39,11 +64,11 @@ impl SegmentBlobStore for FileSegmentStore {
         let mut contents = Vec::with_capacity(8 + bytes.len());
         contents.extend_from_slice(&cursor.to_be_bytes());
         contents.extend_from_slice(bytes);
-        fs::write(self.epoch_path(space_id, epoch), contents).map_err(io_err)
+        fs::write(self.epoch_path(space_id, epoch)?, contents).map_err(io_err)
     }
 
     fn load_segment(&self, space_id: &str, epoch: u64) -> Result<Option<(u64, Vec<u8>)>, StorageError> {
-        match fs::read(self.epoch_path(space_id, epoch)) {
+        match fs::read(self.epoch_path(space_id, epoch)?) {
             Ok(contents) => {
                 if contents.len() < 8 {
                     return Err(StorageError::Corrupt(format!(
@@ -59,7 +84,7 @@ impl SegmentBlobStore for FileSegmentStore {
     }
 
     fn list_epochs(&self, space_id: &str) -> Result<Vec<u64>, StorageError> {
-        let dir = self.space_dir(space_id);
+        let dir = self.space_dir(space_id)?;
         if !dir.exists() {
             return Ok(vec![]);
         }
@@ -173,6 +198,27 @@ mod tests {
 
         store.delete_attachment(&hash).unwrap();
         assert_eq!(store.load_attachment(&hash).unwrap(), None);
+    }
+
+    /// Regression test for the Milestone 2 final whole-branch review:
+    /// `space_id` used to flow unvalidated into a filesystem path, so a
+    /// `space_id` of `"../../evil"` (which, in this p2p app, could
+    /// originate from a remote invite) could write outside the intended
+    /// root directory.
+    #[test]
+    fn save_segment_rejects_a_space_id_that_would_escape_the_root_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileSegmentStore::new(dir.path()).unwrap();
+        let result = store.save_segment("../evil", 0, 0, b"data");
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
+
+    #[test]
+    fn save_segment_rejects_a_space_id_containing_a_path_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileSegmentStore::new(dir.path()).unwrap();
+        let result = store.save_segment("a/b", 0, 0, b"data");
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
     }
 
     #[test]

@@ -14,14 +14,23 @@ fn redb_err(e: impl std::fmt::Display) -> StorageError {
     StorageError::Io(e.to_string())
 }
 
-fn encode(size: u64, mime: &str, first_seen_unreferenced: Option<SystemTime>) -> Vec<u8> {
+/// **Amendment (Milestone 2 final whole-branch review):** previously used
+/// `debug_assert!` to guard the `u16` mime-length prefix, then cast anyway --
+/// in a release build, a mime string longer than `u16::MAX` bytes silently
+/// wrapped, writing a length prefix that disagreed with the actual payload
+/// and corrupting every field `decode` reads after it. Now returns a real
+/// error instead.
+fn encode(size: u64, mime: &str, first_seen_unreferenced: Option<SystemTime>) -> Result<Vec<u8>, StorageError> {
+    let mime_bytes = mime.as_bytes();
+    if mime_bytes.len() > u16::MAX as usize {
+        return Err(StorageError::Corrupt(format!(
+            "mime string is {} bytes, exceeds the u16 length-prefix limit of {}",
+            mime_bytes.len(),
+            u16::MAX
+        )));
+    }
     let mut buf = Vec::new();
     buf.extend_from_slice(&size.to_be_bytes());
-    let mime_bytes = mime.as_bytes();
-    debug_assert!(
-        mime_bytes.len() <= u16::MAX as usize,
-        "mime string too long to encode with a u16 length prefix"
-    );
     buf.extend_from_slice(&(mime_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(mime_bytes);
     match first_seen_unreferenced {
@@ -35,17 +44,39 @@ fn encode(size: u64, mime: &str, first_seen_unreferenced: Option<SystemTime>) ->
             buf.extend_from_slice(&0u64.to_be_bytes());
         }
     }
-    buf
+    Ok(buf)
 }
 
-fn decode(hash: [u8; 32], bytes: &[u8]) -> AttachmentMetadata {
-    let size = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let mime_len = u16::from_be_bytes(bytes[8..10].try_into().unwrap()) as usize;
+/// **Amendment (Milestone 2 final whole-branch review):** previously
+/// returned a bare `AttachmentMetadata` and indexed `bytes` unchecked --
+/// any short or corrupt row (e.g. a partially-written value, or a future
+/// format mismatch) panicked the whole process. Now returns
+/// `Result<_, StorageError>`, bounds-checked before every slice, mirroring
+/// how `all_hashes` already handles a malformed key.
+fn decode(hash: [u8; 32], bytes: &[u8]) -> Result<AttachmentMetadata, StorageError> {
+    let corrupt = || {
+        StorageError::Corrupt(format!(
+            "malformed attachment metadata row ({} bytes)",
+            bytes.len()
+        ))
+    };
+    if bytes.len() < 10 {
+        return Err(corrupt());
+    }
+    let size = u64::from_be_bytes(bytes[0..8].try_into().map_err(|_| corrupt())?);
+    let mime_len = u16::from_be_bytes(bytes[8..10].try_into().map_err(|_| corrupt())?) as usize;
+    if bytes.len() < 10 + mime_len + 1 + 8 {
+        return Err(corrupt());
+    }
     let mime = String::from_utf8_lossy(&bytes[10..10 + mime_len]).to_string();
     let has_unreferenced = bytes[10 + mime_len] == 1;
-    let secs = u64::from_be_bytes(bytes[10 + mime_len + 1..10 + mime_len + 9].try_into().unwrap());
+    let secs = u64::from_be_bytes(
+        bytes[10 + mime_len + 1..10 + mime_len + 9]
+            .try_into()
+            .map_err(|_| corrupt())?,
+    );
     let first_seen_unreferenced = has_unreferenced.then(|| UNIX_EPOCH + Duration::from_secs(secs));
-    AttachmentMetadata { hash, size, mime, first_seen_unreferenced }
+    Ok(AttachmentMetadata { hash, size, mime, first_seen_unreferenced })
 }
 
 pub struct RedbAttachmentMetadataStore {
@@ -72,9 +103,9 @@ impl RedbAttachmentMetadataStore {
 impl AttachmentMetadataStore for RedbAttachmentMetadataStore {
     fn record_seen(&mut self, hash: [u8; 32], size: u64, mime: &str) -> Result<(), StorageError> {
         // Idempotent: if already present, preserve its first_seen_unreferenced.
-        let existing = self.read_raw(&hash)?.map(|b| decode(hash, &b));
+        let existing = self.read_raw(&hash)?.map(|b| decode(hash, &b)).transpose()?;
         let first_seen_unreferenced = existing.and_then(|m| m.first_seen_unreferenced);
-        let value = encode(size, mime, first_seen_unreferenced);
+        let value = encode(size, mime, first_seen_unreferenced)?;
         let txn = self.db.begin_write().map_err(redb_err)?;
         {
             let mut table = txn.open_table(ATTACHMENTS).map_err(redb_err)?;
@@ -84,7 +115,7 @@ impl AttachmentMetadataStore for RedbAttachmentMetadataStore {
     }
 
     fn get(&self, hash: &[u8; 32]) -> Result<Option<AttachmentMetadata>, StorageError> {
-        Ok(self.read_raw(hash)?.map(|b| decode(*hash, &b)))
+        self.read_raw(hash)?.map(|b| decode(*hash, &b)).transpose()
     }
 
     fn all_hashes(&self) -> Result<Vec<[u8; 32]>, StorageError> {
@@ -103,13 +134,13 @@ impl AttachmentMetadataStore for RedbAttachmentMetadataStore {
     }
 
     fn mark_unreferenced_if_unset(&mut self, hash: [u8; 32], now: SystemTime) -> Result<(), StorageError> {
-        let Some(existing) = self.read_raw(&hash)?.map(|b| decode(hash, &b)) else {
+        let Some(existing) = self.read_raw(&hash)?.map(|b| decode(hash, &b)).transpose()? else {
             return Err(StorageError::NotFound);
         };
         if existing.first_seen_unreferenced.is_some() {
             return Ok(()); // already set -- preserve the earliest timestamp
         }
-        let value = encode(existing.size, &existing.mime, Some(now));
+        let value = encode(existing.size, &existing.mime, Some(now))?;
         let txn = self.db.begin_write().map_err(redb_err)?;
         {
             let mut table = txn.open_table(ATTACHMENTS).map_err(redb_err)?;
@@ -119,10 +150,18 @@ impl AttachmentMetadataStore for RedbAttachmentMetadataStore {
     }
 
     fn clear_unreferenced(&mut self, hash: [u8; 32]) -> Result<(), StorageError> {
-        let Some(existing) = self.read_raw(&hash)?.map(|b| decode(hash, &b)) else {
+        let Some(existing) = self.read_raw(&hash)?.map(|b| decode(hash, &b)).transpose()? else {
             return Err(StorageError::NotFound);
         };
-        let value = encode(existing.size, &existing.mime, None);
+        // Amendment (Milestone 2 final whole-branch review): short-circuit
+        // if already clear, mirroring `mark_unreferenced_if_unset`'s own
+        // short-circuit. Without this, every live hash got a write+commit
+        // on every sweep even when nothing changed -- `gc::sweep` calls
+        // this unconditionally for every hash in `live_hashes`.
+        if existing.first_seen_unreferenced.is_none() {
+            return Ok(());
+        }
+        let value = encode(existing.size, &existing.mime, None)?;
         let txn = self.db.begin_write().map_err(redb_err)?;
         {
             let mut table = txn.open_table(ATTACHMENTS).map_err(redb_err)?;
@@ -195,6 +234,12 @@ mod tests {
 
         store.clear_unreferenced(hash).unwrap();
         assert_eq!(store.get(&hash).unwrap().unwrap().first_seen_unreferenced, None);
+
+        // Amendment: clear_unreferenced now short-circuits when already
+        // clear -- calling it again on an already-clear hash must still
+        // succeed as a no-op, not error.
+        store.clear_unreferenced(hash).unwrap();
+        assert_eq!(store.get(&hash).unwrap().unwrap().first_seen_unreferenced, None);
     }
 
     #[test]
@@ -233,8 +278,8 @@ mod tests {
     #[test]
     fn encode_decode_round_trips_empty_mime_and_none_timestamp() {
         let hash = [7u8; 32];
-        let bytes = encode(0, "", None);
-        let meta = decode(hash, &bytes);
+        let bytes = encode(0, "", None).unwrap();
+        let meta = decode(hash, &bytes).unwrap();
         assert_eq!(meta.size, 0);
         assert_eq!(meta.mime, "");
         assert_eq!(meta.first_seen_unreferenced, None);
@@ -247,11 +292,31 @@ mod tests {
         let long_mime: String = "x".repeat(300);
         let hash = [8u8; 32];
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
-        let bytes = encode(u64::MAX, &long_mime, Some(ts));
-        let meta = decode(hash, &bytes);
+        let bytes = encode(u64::MAX, &long_mime, Some(ts)).unwrap();
+        let meta = decode(hash, &bytes).unwrap();
         assert_eq!(meta.size, u64::MAX);
         assert_eq!(meta.mime, long_mime);
         assert_eq!(meta.first_seen_unreferenced, Some(ts));
+    }
+
+    /// Regression test for the Milestone 2 final whole-branch review:
+    /// `encode` used to `debug_assert!` on an over-long mime then cast to
+    /// `u16` anyway, silently wrapping in release builds. Must now return
+    /// `Err` instead.
+    #[test]
+    fn encode_returns_corrupt_error_for_a_mime_longer_than_u16_max() {
+        let too_long = "x".repeat(u16::MAX as usize + 1);
+        let result = encode(0, &too_long, None);
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
+    }
+
+    /// Regression test for the same review: `decode` used to index `bytes`
+    /// unchecked and panic on a short/corrupt row. Must now return `Err`.
+    #[test]
+    fn decode_returns_corrupt_error_instead_of_panicking_on_a_short_row() {
+        let hash = [11u8; 32];
+        let result = decode(hash, b"short");
+        assert!(matches!(result, Err(StorageError::Corrupt(_))));
     }
 
     #[test]

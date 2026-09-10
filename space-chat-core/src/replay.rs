@@ -4,7 +4,9 @@ use crate::storage::{SegmentBlobStore, StorageError};
 
 /// Replays every epoch currently persisted for `space_id` into `projection`,
 /// skipping any epoch whose resulting change's cursor is not after
-/// `projection.watermark()`. This is the mechanism the storage spec calls
+/// `projection.watermark(space_id, epoch)` -- watermark comparison is scoped
+/// per-epoch, since each epoch's `Segment` has its own independent `cursor`
+/// counter (see `Projection::watermark`'s doc comment). This is the mechanism the storage spec calls
 /// "each independently compares its watermark against what's on disk in
 /// `segments/` and replays forward whatever it's missing" — used both for
 /// normal startup catch-up and for kill-and-restart recovery.
@@ -25,7 +27,7 @@ pub fn catch_up<P: Projection>(
         let Some((cursor, bytes)) = store.load_segment(space_id, epoch)? else {
             continue;
         };
-        if SegmentCursor(cursor) <= projection.watermark() {
+        if SegmentCursor(cursor) <= projection.watermark(space_id, epoch) {
             continue;
         }
         // Seed the loaded segment's cursor from the persisted value (not 0) --
@@ -80,16 +82,20 @@ mod tests {
     }
 
     struct CountingProjection {
-        watermark: SegmentCursor,
+        watermarks: HashMap<(String, u64), SegmentCursor>,
         applied: Vec<SegmentChange>,
     }
 
     impl Projection for CountingProjection {
-        fn watermark(&self) -> SegmentCursor {
-            self.watermark
+        fn watermark(&self, space_id: &str, epoch: u64) -> SegmentCursor {
+            self.watermarks
+                .get(&(space_id.to_string(), epoch))
+                .copied()
+                .unwrap_or(SegmentCursor(0))
         }
         fn apply(&mut self, change: &SegmentChange) -> Result<(), ProjectionError> {
-            self.watermark = change.cursor;
+            self.watermarks
+                .insert((change.space_id.clone(), change.epoch), change.cursor);
             self.applied.push(change.clone());
             Ok(())
         }
@@ -108,13 +114,13 @@ mod tests {
         store.save_segment("space-1", 0, change.cursor.0, &change.bytes).unwrap();
 
         let mut projection = CountingProjection {
-            watermark: SegmentCursor(0),
+            watermarks: HashMap::new(),
             applied: vec![],
         };
         catch_up(&store, "space-1", &mut projection).unwrap();
 
         assert_eq!(projection.applied.len(), 1);
-        assert_eq!(projection.watermark(), SegmentCursor(1));
+        assert_eq!(projection.watermark("space-1", 0), SegmentCursor(1));
     }
 
     #[test]
@@ -130,7 +136,7 @@ mod tests {
         store.save_segment("space-1", 0, change.cursor.0, &change.bytes).unwrap();
 
         let mut projection = CountingProjection {
-            watermark: SegmentCursor(1), // already caught up
+            watermarks: HashMap::from([(("space-1".to_string(), 0), SegmentCursor(1))]), // already caught up
             applied: vec![],
         };
         catch_up(&store, "space-1", &mut projection).unwrap();
@@ -139,6 +145,67 @@ mod tests {
             projection.applied.len(),
             0,
             "a projection already at the segment's cursor should not be re-applied"
+        );
+    }
+
+    /// Regression test for the Milestone 2 final whole-branch review's
+    /// Critical finding: `Projection::watermark` was originally a single
+    /// unscoped scalar, so `catch_up` could never correctly replay a space
+    /// with more than one epoch -- a later epoch's `Segment` starts its own
+    /// `cursor` counter fresh from 0 (see `Segment::new`), so its resulting
+    /// `SegmentChange.cursor` can be *lower* than an earlier epoch's, and
+    /// would be wrongly skipped as "already caught up" against a single
+    /// shared watermark. No test in the original milestone used more than
+    /// one epoch, which is exactly why this went uncaught.
+    #[test]
+    fn catch_up_replays_every_epoch_independently_not_just_the_first() {
+        let mut store = FakeSegmentBlobStore { data: HashMap::new() };
+
+        let mut epoch_0 = Segment::new("space-1", 0);
+        epoch_0.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "e0 one".to_string(),
+            attachments: vec![],
+        });
+        epoch_0.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "e0 two".to_string(),
+            attachments: vec![],
+        });
+        let change_0 = epoch_0.latest_change();
+        assert_eq!(change_0.cursor, SegmentCursor(2));
+        store.save_segment("space-1", 0, change_0.cursor.0, &change_0.bytes).unwrap();
+
+        // A fresh epoch's Segment starts cursor at 0 again -- one mutation
+        // here ends at cursor 1, LOWER than epoch 0's cursor of 2. Under the
+        // pre-fix single-scalar-watermark bug, this would compare `1 <= 2`
+        // against epoch 0's already-applied watermark and be skipped.
+        let mut epoch_1 = Segment::new("space-1", 1);
+        epoch_1.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "e1 one".to_string(),
+            attachments: vec![],
+        });
+        let change_1 = epoch_1.latest_change();
+        assert_eq!(change_1.cursor, SegmentCursor(1));
+        store.save_segment("space-1", 1, change_1.cursor.0, &change_1.bytes).unwrap();
+
+        let mut projection = CountingProjection {
+            watermarks: HashMap::new(),
+            applied: vec![],
+        };
+        catch_up(&store, "space-1", &mut projection).unwrap();
+
+        assert_eq!(
+            projection.applied.len(),
+            2,
+            "both epochs must be applied, not just the first"
+        );
+        assert_eq!(projection.watermark("space-1", 0), SegmentCursor(2));
+        assert_eq!(
+            projection.watermark("space-1", 1),
+            SegmentCursor(1),
+            "epoch 1's watermark must be tracked independently of epoch 0's, even though epoch 1's cursor (1) is lower"
         );
     }
 
@@ -174,13 +241,13 @@ mod tests {
         store.save_segment("space-1", 0, change.cursor.0, &change.bytes).unwrap();
 
         let mut projection = CountingProjection {
-            watermark: SegmentCursor(0),
+            watermarks: HashMap::new(),
             applied: vec![],
         };
         catch_up(&store, "space-1", &mut projection).unwrap();
 
         assert_eq!(
-            projection.watermark(),
+            projection.watermark("space-1", 0),
             SegmentCursor(2),
             "watermark must reflect the true cursor (2), not message_count (1)"
         );

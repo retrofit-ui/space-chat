@@ -138,11 +138,17 @@ fn listing_index_catches_up_after_a_simulated_restart() {
     // "Restart": fresh RedbListingIndex, watermark at 0, must catch up.
     let db = Arc::new(redb::Database::create(dir.path().join("listing.redb")).unwrap());
     let mut listing = RedbListingIndex::new(db).unwrap();
-    assert_eq!(listing.watermark(), space_chat_core::projection::SegmentCursor(0));
+    assert_eq!(
+        listing.watermark("space-1", 0),
+        space_chat_core::projection::SegmentCursor(0)
+    );
 
     catch_up(&segment_store, "space-1", &mut listing).unwrap();
 
-    assert_eq!(listing.watermark(), space_chat_core::projection::SegmentCursor(2));
+    assert_eq!(
+        listing.watermark("space-1", 0),
+        space_chat_core::projection::SegmentCursor(2)
+    );
 }
 
 /// The storage spec's own example scenario, translated to a direct test
