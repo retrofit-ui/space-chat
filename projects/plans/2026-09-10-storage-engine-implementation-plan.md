@@ -1902,6 +1902,10 @@ git commit -m "feat(search-tantivy): add TantivySearchIndex implementing SearchI
 
 ### Task 8: Integration — real storage substituted into Milestone 1's convergence test, kill-and-restart, and cross-peer GC
 
+> **Amendment (post-review):** two findings on the original version of this task:
+> 1. The `attachment_survives_the_grace_window...` test's `live` set stayed non-empty (`HashSet::from([hash])`) all the way through `t_20_days`, only going empty at that same instant -- so `first_seen_unreferenced` started at `t_20_days`, not at `t0`, and the final assertion was checking `elapsed == 0 < grace_window`, trivially true regardless of whether 20-elapsed-days-of-being-unreferenced logic works at all. This didn't reproduce the storage spec's own Gherkin scenario (unreferenced starting at day 0, still present after 20 *elapsed* days of that). Fixed below: `live` goes empty starting at `t0` (modeling "Alice deletes the message" as an immediate local liveness change on the device running the sweep -- per the spec, GC is inherently per-device; a *different* device (Bob) still holding a reference is exactly the reason the grace window exists, not something this device's own `sweep` call needs to simulate directly), and the `t_20_days` check now genuinely exercises "20 days elapsed since first-unreferenced, still present."
+> 2. The test file imported `ListingEntry`/`ListingIndex`/`TantivySearchIndex` but never called `append_entry`/`page`/`index_message`/`search` on any of them, despite this crate's own dev-dependency rationale ("to exercise all three [storage backends] together"). Fixed below by extending the convergence test to also drive a `RedbListingIndex` and a `TantivySearchIndex` off the same converged messages, closing the gap rather than just deleting the now-provably-relevant imports.
+
 **Files:**
 - Create: `space-chat-storage-redb/tests/integration.rs` (workspace-level integration test — this crate depends on `space-chat-storage-files` and `space-chat-search-tantivy` as dev-dependencies to exercise all three together)
 - Modify: `space-chat-storage-redb/Cargo.toml` — add dev-dependencies
@@ -1994,6 +1998,46 @@ fn milestone_1_convergence_still_holds_with_real_persistent_storage() {
     let (alice_cursor, alice_bytes) = alice_store.load_segment("space-1", 0).unwrap().unwrap();
     let reloaded = Segment::load(&alice_bytes, "space-1", 0, alice_cursor).unwrap();
     assert_eq!(reloaded.message_count(), 2);
+
+    // Exercise ListingIndex and SearchIndex against the same converged
+    // messages -- this crate's dev-dependencies on space-chat-storage-redb
+    // and space-chat-search-tantivy exist "to exercise all three [storage
+    // backends] together" (this task's own Files note), so do that here
+    // rather than leaving those imports unused.
+    let listing_db = Arc::new(redb::Database::create(alice_dir.path().join("listing.redb")).unwrap());
+    let mut listing = RedbListingIndex::new(listing_db).unwrap();
+    let mut search = TantivySearchIndex::new(alice_dir.path().join("search")).unwrap();
+
+    let mut keys: Vec<String> = reloaded.message_keys().collect();
+    keys.sort(); // deterministic order for indexing/listing
+    for (seq, key) in keys.iter().enumerate() {
+        let msg = reloaded.read_message(key).expect("well-formed message");
+        listing
+            .append_entry(ListingEntry {
+                space_id: "space-1".to_string(),
+                epoch: 0,
+                seq: seq as u64,
+                message_key: key.clone(),
+            })
+            .unwrap();
+        search.index_message("space-1", key, &msg.content).unwrap();
+    }
+    search.commit().unwrap();
+
+    let page = listing.page("space-1", None, 10).unwrap();
+    assert_eq!(page.len(), 2, "both converged messages should be listed");
+
+    let alice_message_key = keys
+        .iter()
+        .find(|k| reloaded.read_message(k).unwrap().content == "from alice")
+        .unwrap()
+        .clone();
+    let found = search.search("space-1", "alice").unwrap();
+    assert_eq!(
+        found,
+        vec![alice_message_key],
+        "search should find alice's message by content, not bob's"
+    );
 }
 
 /// Kill-and-restart: a `ListingIndex` that has fallen behind (simulating a
@@ -2048,31 +2092,35 @@ fn attachment_survives_the_grace_window_when_still_referenced_elsewhere() {
     metadata.record_seen(hash, 24, "image/png").unwrap();
 
     let t0 = SystemTime::now();
-    // Day 0: still referenced (Bob's message references it, even though Bob is offline).
-    let live = HashSet::from([hash]);
-    sweep(&mut metadata, &mut blobs, &live, t0, Duration::from_secs(30 * 24 * 60 * 60)).unwrap();
+    let grace = Duration::from_secs(30 * 24 * 60 * 60);
+    // Day 0: "Alice deletes the message referencing the attachment" -- on the
+    // device running this sweep, the reference is gone immediately (GC is
+    // inherently per-device; per the spec, a *different* device (Bob) still
+    // holding a live reference elsewhere is exactly the reason the grace
+    // window exists, not something this device's own live-set computation
+    // needs to simulate directly). First sweep marks it unreferenced.
+    let empty = HashSet::new();
+    sweep(&mut metadata, &mut blobs, &empty, t0, grace).unwrap();
 
-    // Day 20: Alice's local reference is gone, but the shared spec scenario's
-    // premise -- Bob still has a reference, he's just offline -- means this
-    // device's own live-set computation for its own (Alice's) segments would
-    // still see the reference as long as Bob's tombstone hasn't synced.
-    // Model that directly: still live at day 20.
+    // Day 20: 20 elapsed days of being continuously unreferenced -- still
+    // inside the 30-day grace window, so the attachment must survive. This
+    // is the storage spec's own Gherkin scenario ("20 days pass... Bob's
+    // conversation view still shows the attachment as available").
     let t_20_days = t0 + Duration::from_secs(20 * 24 * 60 * 60);
-    sweep(&mut metadata, &mut blobs, &live, t_20_days, Duration::from_secs(30 * 24 * 60 * 60)).unwrap();
+    sweep(&mut metadata, &mut blobs, &empty, t_20_days, grace).unwrap();
     assert!(
         blobs.load_attachment(&hash).unwrap().is_some(),
-        "attachment must still exist while a reference is considered live"
+        "attachment must still exist after only 20 of 30 grace-window days have elapsed"
     );
 
-    // Day 20+something small: Bob comes online, tombstone syncs, now
-    // genuinely zero live references from this device's perspective -- but
-    // less than 30 days remain before deletion would even be considered,
-    // since the timer only starts once unreferenced is first observed.
-    let empty = HashSet::new();
-    sweep(&mut metadata, &mut blobs, &empty, t_20_days, Duration::from_secs(30 * 24 * 60 * 60)).unwrap();
+    // Day 31: the grace window has now fully elapsed since the reference
+    // first became unreferenced at t0 -- the attachment is finally deleted.
+    let t_31_days = t0 + Duration::from_secs(31 * 24 * 60 * 60);
+    let deleted = sweep(&mut metadata, &mut blobs, &empty, t_31_days, grace).unwrap();
+    assert_eq!(deleted, vec![hash]);
     assert!(
-        blobs.load_attachment(&hash).unwrap().is_some(),
-        "the 30-day grace window has not elapsed since the reference first became unreferenced"
+        blobs.load_attachment(&hash).unwrap().is_none(),
+        "attachment should be deleted once the full 30-day grace window has elapsed"
     );
 }
 ```
