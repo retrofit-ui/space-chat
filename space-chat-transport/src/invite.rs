@@ -47,6 +47,18 @@ impl Invite {
         if hex.len() % 2 != 0 {
             return Err(TransportError::Codec("odd-length hex".to_string()));
         }
+        // Guard against non-ASCII/multi-byte UTF-8 content *before* doing any
+        // byte-offset slicing below: `&str` indexing panics (rather than
+        // erroring) if a slice boundary falls inside a multi-byte character,
+        // and the length check above only ensures an even *byte* length, not
+        // that every 2-byte step lands on a char boundary. Validating that
+        // every byte is an ASCII hex digit up front rules that out entirely,
+        // since ASCII bytes are always single-byte UTF-8 characters.
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(TransportError::Codec(
+                "non-hex-digit character in payload".to_string(),
+            ));
+        }
         let cbor = (0..hex.len())
             .step_by(2)
             .map(|i| {
@@ -84,5 +96,52 @@ mod tests {
     #[test]
     fn decode_link_rejects_malformed_hex_after_the_scheme() {
         assert!(Invite::decode_link("spacechat://join/not-hex-zz").is_err());
+    }
+
+    /// Reproduces a reviewer-found panic: the payload `"aé1"` is 4 *bytes*
+    /// long (`a` = 1 byte, `é` = 2 bytes, `1` = 1 byte), so it passes the
+    /// even-byte-length check, but stepping through it 2 bytes at a time and
+    /// slicing the `&str` (`hex[1..3]`) lands inside `é`'s 2-byte UTF-8
+    /// encoding, which panics with "byte index 2 is not a char boundary"
+    /// instead of returning an error. This must return `Err`, never panic,
+    /// since `decode_link` parses attacker/QR-scan-controlled input.
+    #[test]
+    fn decode_link_rejects_multibyte_utf8_in_payload_without_panicking() {
+        let link = format!("{INVITE_SCHEME_PREFIX}aé1");
+        let result = Invite::decode_link(&link);
+        assert!(matches!(result, Err(TransportError::Codec(_))));
+    }
+
+    /// Same shape of bug, but with the multi-byte character positioned so it
+    /// straddles a *different* 2-byte step boundary, to make sure the fix
+    /// isn't accidentally specific to one offset.
+    #[test]
+    fn decode_link_rejects_multibyte_utf8_at_various_offsets_without_panicking() {
+        for payload in ["é1", "1é", "aaé", "éaa", "aéaé"] {
+            let link = format!("{INVITE_SCHEME_PREFIX}{payload}");
+            let result = Invite::decode_link(&link);
+            assert!(
+                matches!(result, Err(TransportError::Codec(_))),
+                "payload {payload:?} should be rejected, not panic"
+            );
+        }
+    }
+
+    /// `encode_link` CBOR-encodes and then hex-encodes, both of which are
+    /// binary-safe operations, so unicode content in `space_id`/`join_token`
+    /// should already round-trip cleanly. This confirms that's actually true
+    /// (as opposed to merely assumed) rather than only exercising ASCII, as
+    /// the pre-existing round-trip test did.
+    #[test]
+    fn invite_round_trips_unicode_space_id_and_join_token() {
+        let invite = Invite {
+            endpoint_id: [9u8; 32],
+            space_id: "spacé-日本語-🚀".to_string(),
+            join_token: "nonce-é-日本語-🎉".to_string(),
+        };
+        let link = invite.encode_link();
+
+        let decoded = Invite::decode_link(&link).unwrap();
+        assert_eq!(decoded, invite);
     }
 }
