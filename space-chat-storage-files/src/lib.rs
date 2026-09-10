@@ -174,4 +174,24 @@ mod tests {
         store.delete_attachment(&hash).unwrap();
         assert_eq!(store.load_attachment(&hash).unwrap(), None);
     }
+
+    #[test]
+    fn segment_store_detects_corrupt_file_shorter_than_cursor_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSegmentStore::new(dir.path()).unwrap();
+
+        // Manually write a segment file with fewer than 8 bytes,
+        // bypassing save_segment which would construct a valid file.
+        let segment_path = dir.path().join("segments").join("corrupt-space").join("99.automerge");
+        fs::create_dir_all(segment_path.parent().unwrap()).unwrap();
+        fs::write(&segment_path, b"short").unwrap();
+
+        // load_segment should detect the short file and return Corrupt error
+        match store.load_segment("corrupt-space", 99) {
+            Err(StorageError::Corrupt(msg)) => {
+                assert!(msg.contains("shorter than the 8-byte cursor prefix"));
+            }
+            other => panic!("Expected Corrupt error, got: {other:?}"),
+        }
+    }
 }
