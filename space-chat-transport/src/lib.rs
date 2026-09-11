@@ -5,5 +5,6 @@ pub mod error;
 pub mod framing;
 pub mod identity;
 pub mod invite;
+pub mod join;
 pub mod streams;
 pub mod transport;

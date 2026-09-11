@@ -4,9 +4,13 @@ use crate::envelope::Category;
 use crate::error::TransportError;
 use crate::framing::{read_frame, write_frame};
 use crate::identity::TransportIdentity;
+use crate::invite::Invite;
+use crate::join::{JoinRequest, SpaceMembership};
 use crate::streams::StreamManager;
+use space_chat_core::domain::DeviceId;
 use space_chat_core::projection::SegmentChange;
 use space_chat_core::segment::{sync_state, Segment};
+use space_chat_core::sequencer::elect_sequencer;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -25,7 +29,21 @@ pub enum TransportEvent {
     /// into a `ListingIndex`/`SearchIndex`/persistence layer without this
     /// crate needing to know any of those exist.
     IncomingChange(SegmentChange),
+    /// A `JoinRequest` (Task 10) this device -- as the space's elected
+    /// sequencer -- must act on. Only ever fired on the device
+    /// `elect_sequencer` currently names for the request's `space_id`; any
+    /// other member's `run_connection` task forwards the same request on
+    /// instead of surfacing it (see `handle_join_request` below).
+    JoinRequest(JoinRequest),
 }
+
+/// This device's own `DeviceId` plus the `SpaceMembership` source used to
+/// resolve `elect_sequencer` routing for Task 10's join flow, or `None`
+/// before `Transport::configure_membership` is ever called. Aliased purely
+/// to keep the many function signatures that thread this through
+/// (`run_connection`, `handle_join_request`, `dial_and_spawn`) readable --
+/// no behavior attaches to the alias itself.
+type MembershipState = Arc<Mutex<Option<(DeviceId, Arc<dyn SpaceMembership>)>>>;
 
 struct SpaceEntry {
     epoch: u64,
@@ -78,6 +96,13 @@ pub struct Transport {
     /// `serve_attachment`'s doc comment for why this stays an in-memory map
     /// rather than depending on Milestone 2's `AttachmentBlobStore`.
     attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+    /// This device's own `DeviceId` and the `SpaceMembership` source used to
+    /// resolve `elect_sequencer` routing for Task 10's join flow. `None`
+    /// until `configure_membership` is called -- a `Transport` that never
+    /// calls it simply can't participate in join routing (any incoming
+    /// `MlsControl` stream is silently dropped by `handle_join_request`
+    /// below), which is fine for any test/use that doesn't touch invites.
+    membership: MembershipState,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
 }
 
@@ -92,12 +117,14 @@ impl Transport {
         let conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let membership: MembershipState = Arc::new(Mutex::new(None));
 
         let transport = Self {
             endpoint: endpoint.clone(),
             spaces: spaces.clone(),
             conns: conns.clone(),
             attachments: attachments.clone(),
+            membership: membership.clone(),
             events_tx: events_tx.clone(),
         };
 
@@ -111,9 +138,11 @@ impl Transport {
                 tokio::spawn(run_connection(
                     conn,
                     false,
+                    endpoint.clone(),
                     spaces.clone(),
                     conns.clone(),
                     attachments.clone(),
+                    membership.clone(),
                     events_tx.clone(),
                 ));
             }
@@ -167,20 +196,16 @@ impl Transport {
     /// `add_space` against it, once the control-stream digest exchange
     /// (Task 5) determines which spaces the remote peer also knows about.
     pub async fn dial(&self, addr: impl Into<iroh::EndpointAddr>) -> Result<(), TransportError> {
-        let conn = self
-            .endpoint
-            .connect(addr, ALPN)
-            .await
-            .map_err(|e| TransportError::Connection(e.to_string()))?;
-        tokio::spawn(run_connection(
-            conn,
-            true,
+        dial_and_spawn(
+            &self.endpoint,
+            addr,
             self.spaces.clone(),
             self.conns.clone(),
             self.attachments.clone(),
+            self.membership.clone(),
             self.events_tx.clone(),
-        ));
-        Ok(())
+        )
+        .await
     }
 
     /// Wakes every active connection's sync task for `space_id` to run
@@ -269,16 +294,252 @@ impl Transport {
         }
         Ok(bytes)
     }
+
+    /// Registers this device's own MLS `DeviceId` and the `SpaceMembership`
+    /// source used to resolve `elect_sequencer` routing for join requests
+    /// (Task 10). Not needed for any purpose other than the join flow --
+    /// every other `Transport` method works fine with this never having
+    /// been called.
+    pub async fn configure_membership(
+        &self,
+        own_device_id: DeviceId,
+        membership: Arc<dyn SpaceMembership>,
+    ) {
+        *self.membership.lock().await = Some((own_device_id, membership));
+    }
+
+    /// Synchronous by design (per this task's Interfaces note): only reads
+    /// `self.endpoint_id()` (a plain field read, no lock/network access) and
+    /// constructs a value. `space_id`/`join_token` are trusted verbatim from
+    /// the caller -- this crate never validates or interprets either.
+    pub fn generate_invite(&self, space_id: &str, join_token: impl Into<String>) -> Invite {
+        Invite {
+            endpoint_id: *self.endpoint_id().as_bytes(),
+            space_id: space_id.to_string(),
+            join_token: join_token.into(),
+        }
+    }
+
+    /// Dials the inviting device named in `invite` and sends a
+    /// `JoinRequest` over an `MlsControl`-category stream scoped to
+    /// `invite.space_id`. The inviter routes it onward per
+    /// `handle_join_request` below -- this method's only job is delivering
+    /// the request to *a* member; routing to the actual sequencer is the
+    /// receiving side's responsibility, not the joiner's (this is the
+    /// concrete meaning of "invite-based joins still route through the
+    /// space's elected sequencer" even though the inviter need not already
+    /// be the sequencer).
+    pub async fn join_via_invite(
+        &self,
+        invite: &Invite,
+        payload: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        let inviter_id = iroh::EndpointId::from_bytes(&invite.endpoint_id)
+            .map_err(|e| TransportError::Codec(e.to_string()))?;
+        self.dial(addr_via_own_relay(&self.endpoint, inviter_id).await).await?;
+
+        // `dial` spawns `run_connection` in the background; give the
+        // control-stream digest handshake a moment to complete and register
+        // the connection before looking it up. A production implementation
+        // would await a `Connected` event instead of sleeping -- left as a
+        // known simplification, since this plan's tests tolerate the fixed
+        // delay (the same pattern several Task 9 tests already use for the
+        // same reason).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let conn = self
+            .conns
+            .lock()
+            .await
+            .get(&inviter_id)
+            .cloned()
+            .ok_or(TransportError::Timeout)?;
+
+        let manager = StreamManager::new(conn);
+        let mut handle = manager.open(&invite.space_id, Category::MlsControl).await?;
+        let request = JoinRequest {
+            space_id: invite.space_id.clone(),
+            joiner_endpoint_id: *self.endpoint_id().as_bytes(),
+            payload,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&request, &mut bytes).map_err(|e| TransportError::Codec(e.to_string()))?;
+        write_frame(&mut handle.send, &bytes).await
+    }
 }
 
-async fn run_connection(
-    conn: iroh::endpoint::Connection,
-    is_dialer: bool,
+/// Builds a dialable `EndpointAddr` for the bare `EndpointId` `id`,
+/// attaching whatever relay URL `endpoint` itself currently uses (if any).
+///
+/// `Invite` deliberately carries only a bare `[u8; 32]` endpoint id (see its
+/// own doc comment) -- no relay/IP info. `EndpointAddr::from(EndpointId)`
+/// attaches none either, so dialing it directly fails with "No addressing
+/// information available" the moment discovery isn't configured to resolve
+/// it. That's exactly this crate's own `TransportConfig { relay: Some(..) }`
+/// deployment shape (`bootstrap.rs`'s "self-hosted local relay" preset,
+/// which deliberately disables discovery -- see its doc comment): there,
+/// the only address worth trying is whatever relay THIS device itself is
+/// already using, which is valid precisely because every device sharing
+/// that deployment shares one relay. A `relay: None` (production `N0`
+/// preset) deployment doesn't need this fallback at all -- its pkarr/DNS
+/// discovery resolves a bare `EndpointId` well before this function's
+/// best-effort guess would ever matter; this only fires when discovery
+/// found nothing (or isn't configured), same as the existing per-test
+/// pattern of manually attaching `.with_relay_url(..)` seen throughout this
+/// crate's own test suite, just made reusable at the `Transport` API
+/// surface for Task 10's join flow.
+async fn addr_via_own_relay(endpoint: &iroh::Endpoint, id: iroh::EndpointId) -> iroh::EndpointAddr {
+    let mut addr = iroh::EndpointAddr::from(id);
+    // `endpoint.addr()` is a plain snapshot -- right after `bind`, it can
+    // still be empty of relay info (the same race `bootstrap.rs`'s own
+    // tests document, there worked around by building an `EndpointAddr` by
+    // hand from the relay URL the test already has in scope). This
+    // function doesn't have that luxury -- it only has `endpoint` -- so it
+    // uses `iroh::Watcher::updated()` (cancel-safe per its own doc) to wait
+    // for the endpoint's own relay to actually populate, with a bounded
+    // timeout so a genuinely relay-less endpoint doesn't hang forever.
+    use iroh::Watcher;
+    let mut watcher = endpoint.watch_addr();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let current = watcher.get();
+        if let Some(relay_url) = current.relay_urls().next() {
+            addr = addr.with_relay_url(relay_url.clone());
+            break;
+        }
+        if tokio::time::timeout_at(deadline, watcher.updated()).await.is_err() {
+            break; // timed out or disconnected -- fall back to whatever `addr` already has
+        }
+    }
+    addr
+}
+
+/// Dials `addr` and spawns `run_connection` against the resulting
+/// connection, threading through the same shared state every other
+/// connection gets. Factored out of `Transport::dial` so
+/// `handle_join_request`'s forward-to-sequencer path (Task 10) can reuse
+/// exactly the same dial/spawn behavior when it isn't already connected to
+/// the space's elected sequencer, rather than duplicating it.
+async fn dial_and_spawn(
+    endpoint: &iroh::Endpoint,
+    addr: impl Into<iroh::EndpointAddr>,
     spaces: Arc<Mutex<HashMap<String, SpaceEntry>>>,
+    conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
+    attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+    membership: MembershipState,
+    events: mpsc::UnboundedSender<TransportEvent>,
+) -> Result<(), TransportError> {
+    let conn = endpoint
+        .connect(addr, ALPN)
+        .await
+        .map_err(|e| TransportError::Connection(e.to_string()))?;
+    tokio::spawn(run_connection(
+        conn,
+        true,
+        endpoint.clone(),
+        spaces,
+        conns,
+        attachments,
+        membership,
+        events,
+    ));
+    Ok(())
+}
+
+/// Handles one incoming `JoinRequest` on an `MlsControl` stream: if this
+/// device is the space's elected sequencer, surfaces it as a
+/// `TransportEvent::JoinRequest` for a higher layer (a future
+/// `space-chat-openmls` integration) to actually act on; otherwise forwards
+/// the same request, unmodified, to whichever device *is* the elected
+/// sequencer -- dialing it fresh via `dial_and_spawn` if not already
+/// connected. This is what "invite-based joins still route through the
+/// space's elected sequencer" (the transport spec's Pairing/discovery
+/// section) means concretely: the inviter is not required to already be the
+/// sequencer, nor even already connected to it.
+#[allow(clippy::too_many_arguments)]
+async fn handle_join_request(
+    mut handle: crate::streams::StreamHandle,
+    space_id: String,
+    endpoint: iroh::Endpoint,
+    spaces: Arc<Mutex<HashMap<String, SpaceEntry>>>,
+    membership: MembershipState,
     conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
     attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
     events: mpsc::UnboundedSender<TransportEvent>,
 ) {
+    let Ok(bytes) = read_frame(&mut handle.recv).await else { return };
+    let Ok(request): Result<JoinRequest, _> = ciborium::from_reader(bytes.as_slice()) else { return };
+
+    // Destructured into `membership_source` (the `Arc<dyn SpaceMembership>`)
+    // to avoid shadowing the outer `membership: Arc<Mutex<Option<...>>>`
+    // parameter, which is still needed below to pass on to `dial_and_spawn`
+    // (so the freshly-dialed connection to the sequencer also carries
+    // membership config, same as every other connection this device makes).
+    let Some((own_device_id, membership_source)) = membership.lock().await.clone() else { return };
+    let members = membership_source.members(&space_id);
+    let Some(sequencer) = elect_sequencer(&members) else { return };
+
+    if sequencer == own_device_id {
+        let _ = events.send(TransportEvent::JoinRequest(request));
+        return;
+    }
+
+    let Some(sequencer_endpoint) = membership_source.endpoint_for(sequencer) else { return };
+
+    // Not already connected to the sequencer? Dial it fresh, exactly like
+    // `Transport::dial` would, then give the handshake a moment to land --
+    // mirroring `join_via_invite`'s own fixed-delay simplification above,
+    // for the same reason. If the dial itself fails (sequencer unreachable),
+    // this request is simply dropped: there is no further fallback in this
+    // milestone (a known gap -- see this plan's closing notes on retry /
+    // queuing strategies for an offline sequencer).
+    if conns.lock().await.get(&sequencer_endpoint).is_none() {
+        let sequencer_addr = addr_via_own_relay(&endpoint, sequencer_endpoint).await;
+        let _ = dial_and_spawn(
+            &endpoint,
+            sequencer_addr,
+            spaces.clone(),
+            conns.clone(),
+            attachments.clone(),
+            membership.clone(),
+            events.clone(),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    let conn = conns.lock().await.get(&sequencer_endpoint).cloned();
+    let Some(conn) = conn else { return }; // dial failed or handshake didn't land in time
+    let manager = StreamManager::new(conn);
+    if let Ok(mut forward_handle) = manager.open(&space_id, Category::MlsControl).await {
+        let _ = write_frame(&mut forward_handle.send, &bytes).await;
+    }
+}
+
+// Deliberately NOT an `async fn`: `run_connection` (via the `MlsControl`
+// dispatch arm below, Task 10) spawns `handle_join_request`, which -- to
+// forward a join request to a sequencer this device isn't already connected
+// to -- calls `dial_and_spawn`, which itself calls back into
+// `run_connection`. That mutual recursion makes the ordinary `async fn`
+// desugaring (an opaque, self-referential `impl Future`) something rustc
+// cannot resolve ("cannot check whether the hidden type of opaque type
+// satisfies auto traits") -- the same class of "recursive `async fn`" issue
+// that requires boxing even for direct self-recursion. Returning an
+// explicit, already-boxed trait object here breaks the cycle: nothing
+// upstream needs to infer `run_connection`'s own hidden opaque type as part
+// of resolving anything else's, because the signature already says
+// precisely what it returns.
+#[allow(clippy::too_many_arguments)]
+fn run_connection(
+    conn: iroh::endpoint::Connection,
+    is_dialer: bool,
+    endpoint: iroh::Endpoint,
+    spaces: Arc<Mutex<HashMap<String, SpaceEntry>>>,
+    conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
+    attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+    membership: MembershipState,
+    events: mpsc::UnboundedSender<TransportEvent>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
     // Adaptation vs. the brief: verified against `iroh` 1.2.0's source
     // (`src/endpoint/connection.rs`) — `Connection::remote_id(&self)`
     // returns a plain `EndpointId`, not `Result<EndpointId, _>`, for a
@@ -485,10 +746,31 @@ async fn run_connection(
                         envelope.space_id,
                     ));
                 }
-                // MlsControl (Task 10), Gossip, Ephemeral: not opened by
-                // this milestone's implementation (see this function's
-                // earlier comment on Gossip) or handled by a later task.
-                Category::MlsControl | Category::Gossip | Category::Ephemeral => {}
+                Category::MlsControl => {
+                    // Task 10: route this join request per
+                    // `handle_join_request`'s doc comment -- surface it if
+                    // this device is the space's elected sequencer,
+                    // otherwise forward it on. Coexists with the
+                    // `AutomergeSync` epoch gate and `AttachmentTransfer`
+                    // space gate above/below without touching either: this
+                    // arm only reads `membership` (its own dedicated lock,
+                    // never `spaces`/`conns` held across it) and dispatches
+                    // to its own handler.
+                    tokio::spawn(handle_join_request(
+                        handle,
+                        envelope.space_id,
+                        endpoint.clone(),
+                        spaces.clone(),
+                        membership.clone(),
+                        conns.clone(),
+                        attachments.clone(),
+                        events.clone(),
+                    ));
+                }
+                // Gossip, Ephemeral: not opened by this milestone's
+                // implementation (see this function's earlier comment on
+                // Gossip) or handled by a later task.
+                Category::Gossip | Category::Ephemeral => {}
             },
             // Important #3 fix: only a `Connection`-variant error means
             // the connection itself is gone (see `streams.rs`'s
@@ -519,6 +801,7 @@ async fn run_connection(
         }
     }
     let _ = events.send(TransportEvent::Disconnected { endpoint_id: remote_id });
+    })
 }
 
 /// Serves one incoming attachment request: reads the requested hash, writes
