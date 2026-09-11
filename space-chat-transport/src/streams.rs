@@ -11,16 +11,25 @@ pub struct StreamHandle {
 }
 
 /// Opens/accepts per-`(space_id, category)` streams on one already-
-/// established `iroh::endpoint::Connection`, lazily — per the transport
-/// spec, a stream set is opened only once a space becomes active between
-/// two peers, not eagerly for every shared space regardless of activity.
-/// This type owns no notion of *which* spaces are active; that policy
-/// decision belongs to `Transport` (Task 7), which calls `open` only for
-/// spaces present in both its local registry and the remote peer's
-/// `exchange_digests` (Task 5) result, at a *matching epoch* -- not based
-/// on comparing `heads` (skipping the open when `heads` already match
-/// would be a further efficiency optimization, not implemented by this
-/// crate).
+/// established `iroh::endpoint::Connection`.
+///
+/// Doc correction (final review): this comment previously claimed streams
+/// are opened "lazily... only once a space becomes active between two
+/// peers, not eagerly for every shared space regardless of activity."
+/// That is NOT what the shipped code does. This type owns no opening
+/// policy at all -- it just opens whatever it is told to -- and its only
+/// caller, `Transport::run_connection` (Task 7), opens an `AutomergeSync`
+/// stream EAGERLY for EVERY space present in both its local registry and
+/// the remote peer's `exchange_digests` (Task 5) result at a *matching
+/// epoch*, all at once, immediately after the handshake, regardless of
+/// whether that space has any activity. The epoch match is the only gate;
+/// `heads` are not compared (skipping the open when `heads` already match
+/// would be a further efficiency optimization, not implemented).
+///
+/// Relatedly, the transport spec's requirement that idle per-space streams
+/// eventually get closed is not implemented anywhere in this milestone:
+/// an opened sync stream lives for the whole connection. See the transport
+/// plan's post-implementation amendments.
 ///
 /// Each call to `open` produces a brand-new QUIC stream — this type does
 /// not cache or reuse streams by `(space_id, category)`. The brief's

@@ -81,6 +81,41 @@ const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// size bound) can raise this or make it configurable.
 const MAX_ATTACHMENT_SIZE: usize = 100 * 1024 * 1024;
 
+/// Deadline for any SINGLE peer-driven `read_frame` on a request/response
+/// stream (`serve_attachment_request`, `handle_join_request`,
+/// `request_attachment`). Without it, a peer that opens a stream and then
+/// sends nothing -- or stops sending partway through a frame -- parks the
+/// handling task forever. That was never an unbounded DoS (QUIC's own
+/// concurrent-stream limits cap how many such streams a peer can have in
+/// flight), but a per-read deadline is cheap, real hardening.
+///
+/// 30 seconds, chosen deliberately on the generous side: by the time any of
+/// these reads happen the QUIC connection is already established and the
+/// peer has already committed to the exchange, so a well-behaved peer's
+/// next frame is typically milliseconds away -- even across a relay, on a
+/// bad mobile link, with a large attachment being chunked. The value only
+/// needs to be comfortably larger than any legitimate inter-frame gap, not
+/// tuned; erring long keeps a slow-but-honest peer working while still
+/// bounding a silent one. Deliberately NOT applied to `run_automerge_sync`'s
+/// reader task, whose stream is long-lived and legitimately idle for
+/// arbitrarily long stretches between changes.
+const PEER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `read_frame` with `PEER_READ_TIMEOUT` applied, mapping an elapsed
+/// deadline to `TransportError::Timeout`. Note this makes the read
+/// cancellation-unsafe-on-timeout in the same way `read_frame` itself is
+/// (a timed-out read may have consumed part of a frame) -- that's fine at
+/// every call site here, because a timeout is always treated as fatal for
+/// the stream: the caller returns and drops the stream rather than
+/// attempting another read on it.
+async fn read_frame_timeout(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<Vec<u8>, TransportError> {
+    tokio::time::timeout(PEER_READ_TIMEOUT, read_frame(recv))
+        .await
+        .map_err(|_| TransportError::Timeout)?
+}
+
 pub struct Transport {
     endpoint: iroh::Endpoint,
     spaces: Arc<Mutex<HashMap<String, SpaceEntry>>>,
@@ -90,6 +125,33 @@ pub struct Transport {
     /// attachment transfer structurally direct-endpoint-only (see its doc
     /// comment below): there is no path from a hash lookup to "try some
     /// other peer instead."
+    ///
+    /// Known limitation (deliberately not fixed in this milestone): this
+    /// map holds AT MOST ONE connection per remote `EndpointId`, but
+    /// nothing prevents two connections existing between the same pair of
+    /// peers. If two peers dial each other at roughly the same time
+    /// (mutual/concurrent dial), QUIC happily establishes two independent
+    /// connections; both `run_connection` tasks insert under the same key
+    /// and both independently emit `Connected`/`Disconnected`. Two
+    /// consequences a consumer must tolerate.
+    ///
+    /// First: `Connected` can fire twice for the same `endpoint_id` with
+    /// no intervening `Disconnected`, breaking the otherwise-stated
+    /// pairing invariant.
+    ///
+    /// Second: if the connection that happens to be stored here closes
+    /// while the other is still live, its cleanup removes the entry -- the
+    /// `stable_id` guard at the bottom of `run_connection` only protects
+    /// the *other* direction of this race (it stops a task from evicting a
+    /// newer connection's entry, but cannot restore the surviving
+    /// connection's entry once the stored one is gone). `request_attachment`
+    /// then returns `NotFound` against a peer this process is in fact still
+    /// connected to.
+    ///
+    /// Fixing this properly means tracking possibly-multiple live
+    /// connections per peer with refcounted `Connected`/`Disconnected`
+    /// emission -- real design work, deferred (see the transport plan's
+    /// post-implementation amendments).
     conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
     /// This device's own copies of attachment bytes, keyed by content hash,
     /// available to serve to any peer that asks for them directly. See
@@ -165,15 +227,53 @@ impl Transport {
     /// knows both, having constructed or loaded this `Segment` — supplies
     /// them alongside it.
     ///
-    /// This does NOT retroactively push `space_id` onto connections that
-    /// are already established: only the dialer side of `run_connection`
-    /// opens sync streams for registered spaces, and only once, immediately
-    /// after that connection's digest exchange (Task 5) completes. So a
-    /// space registered here is picked up by (a) any *future* `dial()`
-    /// call's digest exchange, and (b) the accepter side of any connection
-    /// whenever the remote peer opens a stream naming this `space_id` — but
-    /// a connection that was already established before this call won't
-    /// get a stream for it unless the remote peer initiates one.
+    /// # Known limitation: a space registered here never syncs over an already-established connection
+    ///
+    /// (In either direction. Read this before relying on dynamic space
+    /// registration.)
+    ///
+    /// The control-stream digest exchange (`exchange_digests`, Task 5) runs
+    /// exactly ONCE per connection, immediately after that connection's
+    /// handshake, and the resulting remote-digest snapshot is frozen for
+    /// the connection's entire lifetime. Both the dialer's
+    /// stream-opening decision and the accepter's incoming-stream epoch
+    /// gate consult that one snapshot. So a space registered by this call
+    /// is synced ONLY over connections established (dialed or accepted)
+    /// *after* this call returns.
+    ///
+    /// A space added while a connection already exists will not sync over
+    /// that pre-existing connection at all -- not eventually, not on
+    /// retry, never, for as long as that connection lives (and this
+    /// milestone's roaming-survival design deliberately makes connections
+    /// long-lived). This holds in BOTH directions: no peer running this
+    /// code ever opens a sync stream outside the immediate post-handshake
+    /// window, so there is no inbound stream to accept; and even if one
+    /// arrived, the accepter's epoch gate checks it against the stale
+    /// snapshot, where `.get(space_id)` is `None`, and silently drops it.
+    /// Attachment transfer is affected by the same frozen snapshot:
+    /// `serve_attachment_request`'s `remote_spaces` check is built from it
+    /// too, so an attachment request naming a late-registered space is
+    /// answered as "not found."
+    ///
+    /// This is a known, documented limitation -- NOT a self-healing gap.
+    /// Re-negotiating digests mid-connection when the local space set
+    /// changes is real design work deferred to Milestone 4's composition
+    /// root or a dedicated follow-up (see the transport plan's
+    /// post-implementation amendments). Until then, a caller must register
+    /// every space it cares about BEFORE dialing or accepting the
+    /// connections it expects to sync them over.
+    ///
+    /// # Lock-order contract
+    ///
+    /// Never call `notify_local_change`, `add_space`, or `dial` while
+    /// holding a lock on a `Segment` `Arc` you also passed to `add_space`
+    /// -- always drop your own segment guard first. Those methods lock this
+    /// `Transport`'s internal `spaces` map, and connection tasks lock
+    /// individual segments; taking the two in the opposite order from a
+    /// caller is what would close a deadlock cycle. (`run_connection` holds
+    /// up its end by never holding `spaces` across a `Segment` lock -- see
+    /// its digest-building block -- so this contract is about caller
+    /// hygiene, not a live deadlock in the current code.)
     ///
     /// TODO(Milestone 4 or a follow-up): re-registering an already-tracked
     /// `space_id` (calling this again with the same key) replaces the
@@ -261,9 +361,16 @@ impl Transport {
         // completion or the whole `request_attachment` future is dropped,
         // in which case there's no partial state left for anything else to
         // observe.
+        //
+        // Review fix: each individual chunk read is bounded by
+        // `PEER_READ_TIMEOUT` (see `read_frame_timeout`), so a peer that
+        // opens the response and then goes silent mid-transfer surfaces as
+        // `TransportError::Timeout` rather than parking this call forever.
+        // The bound is per-frame, not for the whole transfer: a genuinely
+        // large attachment that keeps making progress is never cut off.
         let mut bytes = Vec::new();
         loop {
-            let chunk = read_frame(&mut handle.recv).await?;
+            let chunk = read_frame_timeout(&mut handle.recv).await?;
             if chunk.is_empty() {
                 break;
             }
@@ -505,7 +612,11 @@ async fn handle_join_request(
     attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
     events: mpsc::UnboundedSender<TransportEvent>,
 ) {
-    let Ok(bytes) = read_frame(&mut handle.recv).await else { return };
+    // Review fix: bounded by `PEER_READ_TIMEOUT` -- a peer that opens an
+    // `MlsControl` stream and never sends its `JoinRequest` frame used to
+    // park this task for the connection's lifetime. A timeout is handled
+    // exactly like any other read failure: drop the stream and return.
+    let Ok(bytes) = read_frame_timeout(&mut handle.recv).await else { return };
     let Ok(request): Result<JoinRequest, _> = ciborium::from_reader(bytes.as_slice()) else { return };
 
     // Important I1 fix: `space_id` (this function's parameter) comes from
@@ -629,12 +740,37 @@ fn run_connection(
     // API, so this calls it directly.
     let remote_id = conn.remote_id();
 
+    // Critical #1 fix (lock-order inversion): this block used to hold the
+    // `spaces` guard across `entry.segment.lock().await` for every space,
+    // establishing a `spaces -> segment` lock order inside this task. The
+    // natural caller pattern is the OPPOSITE order -- lock the `Segment`
+    // you own to append a message, then (while that guard is still alive)
+    // call `Transport::notify_local_change`, which locks `spaces`. With
+    // both orders live concurrently, the cycle closes and NOTHING involving
+    // `spaces` ever makes progress again: not just that one call, but every
+    // future `add_space`/`dial`/`notify_local_change` and every other
+    // connection's `run_connection`, because they all need `spaces` too.
+    //
+    // The fix is the same shape already used for the dialer's
+    // `manager.open()` block below: clone out exactly what's needed
+    // (`space_id`, `epoch`, and the `Arc<Mutex<Segment>>` handle itself)
+    // while holding `spaces`, DROP that guard, and only then lock each
+    // individual `segment`. `spaces` is therefore never held across a
+    // `segment` lock, so this task only ever takes one of the two locks at
+    // a time and no cycle can form regardless of what order a caller uses.
+    // See `Transport::add_space`'s doc comment for the caller-side contract.
     let local_digests = {
-        let guard = spaces.lock().await;
-        let mut digests = Vec::with_capacity(guard.len());
-        for (space_id, entry) in guard.iter() {
-            let heads = entry.segment.lock().await.heads().iter().map(change_hash_to_bytes).collect();
-            digests.push(SpaceDigest { space_id: space_id.clone(), epoch: entry.epoch, heads });
+        let space_snapshot: Vec<(String, u64, Arc<Mutex<Segment>>)> = {
+            let guard = spaces.lock().await;
+            guard
+                .iter()
+                .map(|(space_id, entry)| (space_id.clone(), entry.epoch, entry.segment.clone()))
+                .collect()
+        }; // `guard` dropped here -- BEFORE any `segment.lock()` below.
+        let mut digests = Vec::with_capacity(space_snapshot.len());
+        for (space_id, epoch, segment) in space_snapshot {
+            let heads = segment.lock().await.heads().iter().map(change_hash_to_bytes).collect();
+            digests.push(SpaceDigest { space_id, epoch, heads });
         }
         digests
     };
@@ -899,7 +1035,11 @@ async fn serve_attachment_request(
     remote_spaces: Arc<HashSet<String>>,
     space_id: String,
 ) {
-    let Ok(hash_bytes) = read_frame(&mut handle.recv).await else { return };
+    // Review fix: bounded by `PEER_READ_TIMEOUT` -- a peer that opens an
+    // `AttachmentTransfer` stream and never sends its hash frame used to
+    // park this task for the connection's lifetime. A timeout is handled
+    // exactly like any other read failure: drop the stream and return.
+    let Ok(hash_bytes) = read_frame_timeout(&mut handle.recv).await else { return };
     let Ok(hash): Result<[u8; 32], _> = hash_bytes.try_into() else { return };
 
     // Important #5 fix: `request_attachment`'s API takes a `space_id`,
@@ -1600,5 +1740,286 @@ mod tests {
         })
         .await
         .expect("bob should see the after-roam message over the same connection, with no re-dial");
+    }
+
+    /// Final-review Critical #1 regression test: lock-order inversion
+    /// between `Transport`'s internal `spaces` map and the per-space
+    /// `Segment` mutexes used to deadlock the ENTIRE `Transport`.
+    ///
+    /// Before the fix, `run_connection`'s digest-building block held the
+    /// `spaces` guard while awaiting `entry.segment.lock()` for each space
+    /// -- lock order `spaces -> segment`. The natural (if careless) caller
+    /// pattern is the exact opposite: lock the `Segment` you own to append
+    /// a message, then call `notify_local_change` (which locks `spaces`)
+    /// without having dropped your segment guard first -- lock order
+    /// `segment -> spaces`. This test drives both orders at once:
+    ///
+    ///   1. Alice holds her `Segment` guard.
+    ///   2. Bob dials alice, so alice's inbound `run_connection` task
+    ///      reaches the digest-building block. Pre-fix, it grabs `spaces`
+    ///      and then blocks forever on alice's still-held segment lock,
+    ///      pinning `spaces` for good.
+    ///   3. Alice, still holding that guard, calls `notify_local_change`,
+    ///      which needs `spaces`.
+    ///
+    /// Pre-fix this hangs permanently -- and not just this call: every
+    /// future `add_space`/`dial`/`notify_local_change` and every other
+    /// connection's `run_connection` needs `spaces` too, so the whole
+    /// `Transport` is bricked. Post-fix, `run_connection` snapshots what it
+    /// needs out of `spaces` and drops that guard BEFORE touching any
+    /// segment, so it never holds both, no cycle can form, and the call
+    /// returns promptly.
+    ///
+    /// Verified RED-then-GREEN: with the fix reverted, this test fails on
+    /// the `notify_local_change` timeout below; with the fix applied, it
+    /// passes. The timeout is what turns the deadlock into a clean failure
+    /// rather than a hung test binary.
+    #[tokio::test]
+    async fn notify_local_change_does_not_deadlock_when_a_caller_holds_its_own_segment_lock() {
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+        let alice_identity = TransportIdentity::generate();
+        let bob_identity = TransportIdentity::generate();
+        let (alice, _alice_events) = Transport::bind(&alice_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (bob, _bob_events) = Transport::bind(&bob_identity, TransportConfig { relay: Some((relay_map, relay_url)) }).await.unwrap();
+
+        let alice_segment = Arc::new(Mutex::new(Segment::new("space-1", 0)));
+        let bob_segment = Arc::new(Mutex::new(Segment::new("space-1", 0)));
+        alice.add_space("space-1", 0, alice_segment.clone()).await;
+        bob.add_space("space-1", 0, bob_segment.clone()).await;
+
+        // The caller grabs its own segment lock FIRST and keeps holding it
+        // -- exactly what a caller appending a message would naturally do.
+        let mut alice_guard = alice_segment.lock().await;
+        alice_guard.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "appended while holding the segment lock".to_string(),
+            attachments: vec![],
+        });
+
+        // Bob dials alice, driving alice's inbound `run_connection` into the
+        // digest-building block while the guard above is still held.
+        bob.dial(alice.endpoint_addr()).await.unwrap();
+
+        // Give alice's accept loop time to actually reach that block. This
+        // sleep isn't load-bearing for correctness of the *fixed* code (the
+        // fixed code can't deadlock whenever it gets there); it's what makes
+        // the PRE-fix code reliably reach the deadlock state rather than
+        // racing past it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The call under test: still holding `alice_guard`.
+        tokio::time::timeout(Duration::from_secs(5), alice.notify_local_change("space-1"))
+            .await
+            .expect(
+                "notify_local_change hung while the caller held a Segment lock -- this is the \
+                 spaces/segment lock-order inversion deadlock: run_connection must not hold the \
+                 `spaces` guard across a `segment.lock().await`",
+            );
+
+        // And prove the whole `Transport` is still usable, not merely that
+        // this one call returned: a second `spaces`-taking public API call
+        // must also complete promptly while the guard is STILL held.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            alice.add_space("space-2", 0, Arc::new(Mutex::new(Segment::new("space-2", 0)))),
+        )
+        .await
+        .expect("add_space hung too -- the `spaces` mutex is still pinned by a connection task");
+
+        // Finally, release the guard and confirm the connection was merely
+        // delayed, not broken: sync still converges afterwards.
+        drop(alice_guard);
+        alice.notify_local_change("space-1").await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if bob_segment.lock().await.message_count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("once the caller's segment guard is dropped, sync should proceed normally");
+    }
+
+    /// Final-review Critical #2: this test PINS A KNOWN, DOCUMENTED
+    /// LIMITATION. It is deliberately NOT asserting desired behavior.
+    ///
+    /// `exchange_digests` runs exactly once per connection, right after the
+    /// handshake, and both the dialer's stream-opening decision and the
+    /// accepter's incoming-stream epoch gate consult that one frozen
+    /// snapshot for the connection's whole lifetime. So a space registered
+    /// via `add_space` AFTER a connection already exists never syncs over
+    /// that connection -- in either direction, ever. See `add_space`'s doc
+    /// comment for the full explanation, and the transport plan's
+    /// post-implementation amendments for why re-negotiation was deferred
+    /// rather than built here.
+    ///
+    /// The point of pinning it: (a) nobody can "accidentally fix" this
+    /// without this test going red and forcing them to update the
+    /// documentation with it, and (b) when someone *intentionally* builds
+    /// mid-connection re-negotiation, this test going red is the expected,
+    /// understood signal -- delete or invert it then, don't work around it.
+    #[tokio::test]
+    async fn a_space_added_after_a_connection_exists_does_not_sync_over_it_known_limitation() {
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+        let alice_identity = TransportIdentity::generate();
+        let bob_identity = TransportIdentity::generate();
+        let (alice, mut alice_events) = Transport::bind(&alice_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (bob, mut bob_events) = Transport::bind(&bob_identity, TransportConfig { relay: Some((relay_map, relay_url)) }).await.unwrap();
+
+        // A space both sides DO know about before connecting, purely so a
+        // real, healthy, long-lived connection exists to test against.
+        alice.add_space("space-early", 0, Arc::new(Mutex::new(Segment::new("space-early", 0)))).await;
+        bob.add_space("space-early", 0, Arc::new(Mutex::new(Segment::new("space-early", 0)))).await;
+
+        alice.dial(bob.endpoint_addr()).await.unwrap();
+        for events in [&mut alice_events, &mut bob_events] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match events.recv().await {
+                        Some(TransportEvent::Connected { .. }) => break,
+                        Some(_) => continue,
+                        None => panic!("event channel closed before Connected"),
+                    }
+                }
+            })
+            .await
+            .expect("both sides should observe Connected before the late registration");
+        }
+
+        // NOW register a brand-new space on both sides, over the existing
+        // connection, and produce content in it.
+        let alice_late = Arc::new(Mutex::new(Segment::new("space-late", 0)));
+        let bob_late = Arc::new(Mutex::new(Segment::new("space-late", 0)));
+        alice.add_space("space-late", 0, alice_late.clone()).await;
+        bob.add_space("space-late", 0, bob_late.clone()).await;
+
+        alice_late.lock().await.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "content in a space registered after the handshake".to_string(),
+            attachments: vec![],
+        });
+        alice.notify_local_change("space-late").await;
+
+        // Pinned expectation: bob NEVER receives it over the pre-existing
+        // connection. 4 seconds is ~80x the propagation time the other
+        // convergence tests in this module actually need (they poll at 50ms
+        // and pass well inside a second), so this is a meaningful window,
+        // not a too-short one that would pass vacuously.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            bob_late.lock().await.message_count(),
+            0,
+            "KNOWN LIMITATION PINNED BY THIS TEST: a space registered via add_space after a \
+             connection's one-shot digest exchange does not sync over that connection. If this \
+             assertion now fails, mid-connection re-negotiation has been implemented (or \
+             partially implemented) -- that is a GOOD change, but it must come with updates to \
+             `Transport::add_space`'s doc comment and the transport plan's amendment notes, and \
+             this test should be replaced with one asserting the new, correct behavior.",
+        );
+
+        // And the same frozen snapshot is why an attachment request naming
+        // the late-registered space fails too (`serve_attachment_request`'s
+        // `remote_spaces` check is built from it). Pinned for the same
+        // reason, via the same mechanism.
+        use sha2::{Digest, Sha256};
+        let content = b"an attachment in a late-registered space".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let hash: [u8; 32] = hasher.finalize().into();
+        bob.serve_attachment(hash, content).await;
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(10),
+            alice.request_attachment("space-late", hash, bob.endpoint_id()),
+        )
+        .await
+        .expect("the request itself should complete (as NotFound), not hang");
+        assert!(
+            fetched.is_err(),
+            "KNOWN LIMITATION PINNED BY THIS TEST: an attachment request naming a space \
+             registered after the handshake is refused, because the serving side's \
+             `remote_spaces` set comes from the same frozen digest snapshot. Same caveat as \
+             above if this starts passing.",
+        );
+
+        // Sanity: the connection itself is still perfectly healthy -- this
+        // test is pinning a *scoping* limitation, not a dead connection.
+        assert!(
+            !matches!(alice_events.try_recv(), Ok(TransportEvent::Disconnected { .. })),
+            "the connection should still be up; this test pins a scoping limitation, not a drop",
+        );
+    }
+
+    /// Final-review Important #1: another test that PINS A KNOWN,
+    /// DOCUMENTED LIMITATION rather than asserting desired behavior (see
+    /// the `conns` field's doc comment).
+    ///
+    /// `conns` is keyed by `EndpointId` alone, but two peers that dial each
+    /// other concurrently establish TWO independent QUIC connections. Each
+    /// gets its own `run_connection` task, each inserts under the same
+    /// `conns` key, and each independently emits `Connected`/`Disconnected`
+    /// -- so a consumer can observe `Connected` twice for the same peer
+    /// with no `Disconnected` in between, breaking the pairing invariant
+    /// the `TransportEvent` docs otherwise imply. (The nastier consequence
+    /// -- the newer connection's cleanup evicting the still-live older
+    /// connection's `conns` entry, making `request_attachment` return
+    /// `NotFound` against a healthy peer -- is timing-dependent and not
+    /// pinned here; only the deterministic duplicate-event symptom is.)
+    ///
+    /// Fixing this properly means refcounting multiple live connections per
+    /// peer, deliberately deferred. If this assertion starts failing
+    /// because duplicate `Connected` events no longer occur, that is the
+    /// expected signal that someone implemented the fix -- update the
+    /// `conns` doc comment and the plan's amendments along with this test.
+    #[tokio::test]
+    async fn mutual_dial_can_emit_connected_twice_without_a_disconnected_known_limitation() {
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+        let alice_identity = TransportIdentity::generate();
+        let bob_identity = TransportIdentity::generate();
+        let (alice, mut alice_events) = Transport::bind(&alice_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (bob, _bob_events) = Transport::bind(&bob_identity, TransportConfig { relay: Some((relay_map, relay_url)) }).await.unwrap();
+
+        alice.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+        bob.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+
+        let alice_addr = alice.endpoint_addr();
+        let bob_addr = bob.endpoint_addr();
+        // Both directions dialed at once: alice ends up with a dialer-role
+        // `run_connection` AND an accepter-role one, both for bob.
+        let (a, b) = tokio::join!(alice.dial(bob_addr), bob.dial(alice_addr));
+        a.unwrap();
+        b.unwrap();
+
+        let mut connected = 0usize;
+        let saw_two = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match alice_events.recv().await {
+                    Some(TransportEvent::Connected { .. }) => {
+                        connected += 1;
+                        if connected == 2 {
+                            return true;
+                        }
+                    }
+                    // An intervening Disconnected would mean the events were
+                    // properly paired after all -- report that distinctly.
+                    Some(TransportEvent::Disconnected { .. }) => return false,
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_two,
+            "KNOWN LIMITATION PINNED BY THIS TEST: mutual dial should produce two `Connected` \
+             events for the same peer with no `Disconnected` between them, because `conns` is \
+             keyed by EndpointId alone and each of the two connections runs its own \
+             `run_connection`. If this now fails, per-peer connection refcounting has been \
+             implemented -- update the `conns` doc comment, the transport plan's amendment \
+             notes, and replace this test with one asserting the new pairing invariant.",
+        );
     }
 }

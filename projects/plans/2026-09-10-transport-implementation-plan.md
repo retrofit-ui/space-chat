@@ -2,6 +2,26 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> ## ⚠️ STALE CODE EXAMPLES — READ BEFORE USING THIS PLAN AS A REFERENCE
+>
+> **This plan has been implemented. The code examples embedded in Tasks 7, 9,
+> and 10 predate numerous real bugs found during implementation and do NOT
+> reflect the final, correct, shipped behavior.** They are preserved verbatim
+> as a record of the original design intent, not as a description of what the
+> crate does.
+>
+> **`space-chat-transport/src/` is authoritative. This document's embedded
+> code samples are not.** Copying Task 7/9/10's snippets as a design reference
+> would reintroduce this milestone's entire bug list — the lock-across-I/O
+> stall, the lock-order-inversion deadlock, the cancellation-unsafe
+> `read_frame`-in-`select!`, the asymmetric dialer/accepter accept loop, the
+> `Connected`-fired-before-handshake race, the `addr_via_own_relay` busy-spin
+> livelock, unbounded join-request forwarding, and more.
+>
+> See **[Post-implementation amendments](#post-implementation-amendments)** at
+> the bottom of this document for what actually changed, and for the list of
+> known limitations that were deliberately deferred rather than fixed.
+
 **Goal:** Build `space-chat-transport` — a real `iroh`-based networking crate that lets two or more `space-chat-core` instances dial each other by endpoint ID, negotiate per-space activity over a connection-level control stream, exchange Automerge sync/gossip/MLS-control/ephemeral/attachment traffic over lazily-opened, prioritized, per-`(space_id, category)` QUIC streams, pair via a link/QR-encoded invite, and route invite-based joins through the space's elected sequencer — proven by two (and three, for the multi-hop scenario) separate OS processes converging over a local `iroh` test relay.
 
 **Architecture:** One crate, `space-chat-transport`, not several. Unlike Milestone 2's storage crates (which split along genuinely different backend dependency trees — `redb` vs `tantivy` vs plain files, each independently swappable), every piece of transport — connection setup, control-stream digest exchange, per-space stream lifecycle, invite encoding, sequencer-routed joins — depends on the same `iroh` dependency and interoperates constantly within a single connection's lifecycle. Splitting it into multiple crates would be crate-boundary ceremony with no real isolation benefit, so it stays one crate with clear internal modules.
@@ -1091,6 +1111,12 @@ git commit -m "feat(transport): add per-(space_id, category) StreamManager with 
 
 ### Task 7: `Transport` — connection lifecycle + Automerge sync/gossip wired to a shared `Segment`
 
+> **⚠️ Amendment (post-implementation):** the `run_connection` /
+> `run_automerge_sync` code below is STALE and contains several bugs that were
+> found and fixed during implementation. See
+> [Post-implementation amendments](#post-implementation-amendments) for the
+> list; read `space-chat-transport/src/transport.rs` for what actually ships.
+
 **Files:**
 - Create: `space-chat-transport/src/transport.rs`
 - Modify: `space-chat-transport/Cargo.toml` — add `automerge = "0.5"` (matching `space-chat-core`'s pin) as a direct dependency: this task calls `automerge::sync::Message::encode`/`decode` and `automerge::ChangeHash` directly, since `Segment::generate_sync_message`/`receive_sync_message`'s public signatures already expose `automerge::sync::{State, Message}` types (see `space-chat-core/src/segment.rs`), so any caller driving them needs to name those types too.
@@ -1558,6 +1584,12 @@ git commit -m "test(transport): prove multi-hop message convergence needs no rel
 
 ### Task 9: Chunked, direct-endpoint-only attachment transfer
 
+> **⚠️ Amendment (post-implementation):** the attachment-transfer code below is
+> STALE — it has no size cap, no space scoping, no read timeout, and relies on
+> an accept loop that (as written in Task 7) only ran on one side of a
+> connection. See [Post-implementation amendments](#post-implementation-amendments);
+> `space-chat-transport/src/transport.rs` is authoritative.
+
 **Files:**
 - Modify: `space-chat-transport/src/transport.rs`
 - Modify: `space-chat-transport/Cargo.toml` — add `sha2 = "0.10"` (dev-and-runtime dependency, used to verify received attachment bytes against their requested hash — illustrative of the protocol spec's "content hash" field; the real hash algorithm `AttachmentRef.hash` (Milestone 1's `space_chat_core::domain`) ultimately uses is unspecified by that type itself, which is algorithm-agnostic `[u8; 32]`)
@@ -1857,6 +1889,13 @@ git commit -m "feat(transport): add chunked, direct-endpoint-only, hash-verified
 ---
 
 ### Task 10: Sequencer-routed invite join flow
+
+> **⚠️ Amendment (post-implementation):** the join-routing code below is STALE —
+> it has no hop cap, no envelope/payload `space_id` cross-check, no
+> self-dial guard, no read timeout, and silently drops a forward to a
+> sequencer it isn't already connected to (the shipped code dials fresh). See
+> [Post-implementation amendments](#post-implementation-amendments);
+> `space-chat-transport/src/transport.rs` and `join.rs` are authoritative.
 
 **Files:**
 - Create: `space-chat-transport/src/join.rs`
@@ -2602,7 +2641,7 @@ git commit -m "test(transport): prove two/three-process convergence, multi-hop, 
 ## Closing note: what this plan deliberately excludes
 
 - **Real MLS/OpenMLS integration.** `space-chat-openmls` doesn't exist yet (excluded from Milestone 1 as a separable follow-on). This plan defines the `SpaceMembership` trait boundary (Task 10) and treats join-request payloads as opaque bytes throughout; wiring a real `KeyPackage`/Commit flow through that boundary is a future plan's job, once `space-chat-openmls` exists.
-- **The "not connected to the sequencer" gap in `handle_join_request` (Task 10).** If the device forwarding a join request has no existing connection to the elected sequencer, the forward silently drops (see the `let Some(conn) = conn else { return };` line) rather than dialing fresh. A real implementation should dial the sequencer on demand here, the same way `join_via_invite` dials the inviter — left as a known simplification since exercising it doesn't change what this milestone is trying to prove (that routing *decisions* correctly favor the sequencer), and a fresh-dial fallback is a small, mechanical addition once needed.
+- ~~**The "not connected to the sequencer" gap in `handle_join_request` (Task 10).** If the device forwarding a join request has no existing connection to the elected sequencer, the forward silently drops rather than dialing fresh.~~ **CORRECTED (post-implementation): this is no longer true and never shipped that way.** `handle_join_request` DOES dial the sequencer on demand, via `dial_and_spawn` (the same helper `Transport::dial` uses), when it has no existing connection to it. What remains a genuine gap is narrower: if that *dial itself fails* (sequencer offline/unreachable), or the handshake doesn't land inside the fixed 300ms settle delay, the request is dropped with no retry or queuing. That narrower liveness gap is the "sequencer-unreachable" case already covered by the "no new mechanism" bullet further down.
 - **QR-code pixel rendering, and any UI for scanning one.** `Invite::encode_link` (Task 3) is as far as this crate goes; turning that string into pixels (and back) is Milestone 4's job.
 - **A self-hosted relay ("peer server at a price").** Explicitly deferred by the transport spec itself, not something this plan takes a position on.
 - **A TCP fallback transport for UDP-blocking networks.** Documented as a known limitation (Global Constraints), not designed around.
@@ -2619,4 +2658,214 @@ Per this project's established process, run a final review across the whole bran
 - Whether `TransportEvent::IncomingChange(SegmentChange)` is the right shape for the app-shell's `Projection`/`ListingIndex`/`SearchIndex`/live-spec-patching consumers, or whether they need a different granularity (e.g. per-message rather than per-segment-snapshot) — this plan reuses `SegmentChange` as-is from Milestone 1/2 rather than inventing a new shape, but the app-shell plan may have made a different assumption about what it receives.
 - Whether the app-shell plan already assumed a `SpaceMembership` implementation shape (Task 10) different from this plan's — reconcile before `space-chat-app` provides the real one backed by `space-chat-openmls`.
 - Whether `notify_local_change`'s "wake the sync loop, don't pass the change" design (as opposed to, say, an API that takes the new content directly) fits how the app-shell plan intends to drive sends after a local mutation.
+
+---
+
+## Post-implementation amendments
+
+Written after the final whole-branch review of Milestone 3, before merge to
+`main`. Two purposes: (1) record the real fixes made to Tasks 7, 9 and 10 so
+this document's stale code examples can't mislead a future reader, and (2)
+collect, in one place, every known limitation this milestone deliberately
+deferred rather than fixed.
+
+**The source of truth is `space-chat-transport/src/`.** Where this section and
+an earlier code example disagree, the example is wrong.
+
+### Task 7 (`Transport`, connection lifecycle, Automerge sync) — fixes made
+
+- **Lock held across network I/O.** The example held the `spaces` mutex guard
+  across `manager.open(...).await` (a real `open_bi()` plus a network write),
+  which stalls every other public API call and every other connection's task
+  behind one slow peer. Fixed by cloning out `(space_id, segment, notify)`
+  under the lock and dropping the guard before opening anything.
+- **Lock-order inversion deadlocking the whole `Transport`** (final-review
+  Critical #1). The digest-building block held the `spaces` guard across
+  `entry.segment.lock().await`, establishing `spaces → segment`. The natural
+  caller pattern is the opposite (`segment → spaces`: lock your segment to
+  append, then call `notify_local_change`). Run concurrently, the cycle closes
+  and *nothing* that needs `spaces` ever progresses again — every future
+  `add_space`/`dial`/`notify_local_change` and every other connection's
+  `run_connection`. Fixed by snapshotting `(space_id, epoch, Arc<Mutex<Segment>>)`
+  under `spaces` and dropping that guard before locking any segment, so the two
+  locks are never held simultaneously. Regression test:
+  `notify_local_change_does_not_deadlock_when_a_caller_holds_its_own_segment_lock`
+  (verified to fail against the pre-fix code). The caller-side contract is now
+  documented on `Transport::add_space`.
+- **Cancellation-unsafe `read_frame` inside `select!`.** The example raced
+  `read_frame` directly against `notify.notified()` and a timeout.
+  `read_frame` is two sequential `read_exact` calls — not cancellation-safe —
+  so a cancelled branch could drop already-read bytes and permanently desync
+  the stream's frame alignment. Fixed by moving `recv` into a dedicated reader
+  task that forwards whole frames over an `mpsc` channel; the `select!` races
+  the (cancellation-safe) `mpsc::Receiver::recv()` instead.
+- **Asymmetric dialer/accepter loops.** Only the accepter ran an
+  `accept_next()` loop; the dialer opened its sync streams and then blocked on
+  `conn.closed()`. Since `conns` is populated for both roles, asking a
+  dialer-role peer for an attachment hung the requester forever. Both roles now
+  run the same accept loop. Regression test:
+  `accepter_can_request_an_attachment_from_the_dialer`.
+- **`Disconnected` fired on a healthy connection.** The dialer branch fell
+  straight through to sending `Disconnected` after opening its (possibly zero)
+  sync streams. Fixed by the symmetric accept loop above. Regression test:
+  `dialer_reports_disconnected_only_after_the_peer_actually_disconnects`.
+- **`Connected` fired before the handshake.** It was sent at the top of
+  `run_connection`, before `exchange_digests` and before `conns` was populated,
+  so a consumer reacting to it could get a spurious `NotFound` from
+  `request_attachment`. Now sent only after the handshake succeeds and `conns`
+  is populated — and correspondingly, a failed handshake sends *neither* event,
+  preserving `Connected`/`Disconnected` pairing.
+- **Blind `conns` removal on teardown.** A reconnect race could mean a newer
+  connection is already registered under the same `EndpointId`. Teardown now
+  compares `Connection::stable_id()` and only removes the entry if it is still
+  this task's own connection.
+- **Whole-connection teardown on one malformed stream.** Any `accept_next`
+  error used to break the loop. Only `TransportError::Connection(_)` now means
+  the connection is gone; other errors skip that one stream and keep accepting.
+- **Epoch gate missing on the accepter side.** The dialer checked that the
+  remote shares the space at a matching epoch; the accepter didn't, so an
+  inbound stream could sync mismatched-epoch segments. The check is now
+  symmetric.
+- **Heads-based change detection.** Deciding whether a received sync message
+  actually merged anything by comparing a remembered `cursor` was wrong —
+  `cursor` is a document-wide counter another peer's sync task can bump. Now
+  compares `heads()` immediately before and after `receive_sync_message` under
+  the same guard.
+- **`addr_via_own_relay` busy-spin livelock.** `tokio::time::timeout_at(...)`'s
+  outer `Result` was checked with `.is_err()` alone, missing the `Ok(Err(_))`
+  "watcher disconnected" case. A disconnected `Watcher` resolves `Ready` on
+  every poll, so the loop spun a tokio worker at 100% CPU instead of waiting.
+  Both the outer and inner `Result` are now matched explicitly.
+
+### Task 9 (attachment transfer) — fixes made
+
+- **Unbounded accumulation.** `request_attachment` had no size cap; a malicious
+  or buggy peer could stream chunks until the requester OOMed. Now capped by
+  `MAX_ATTACHMENT_SIZE` (100 MiB), checked *before* appending each chunk.
+- **No space scoping at all.** `request_attachment` took a `space_id` that
+  nothing checked — any connected peer could fetch any hash.
+  `serve_attachment_request` now refuses a `space_id` the requester didn't
+  claim in its `ControlHello`. **This is a best-effort filter, not an
+  authorization boundary**, and the code says so: the claim is self-asserted
+  with no membership proof, and the `attachments` map has no space dimension
+  anyway. Real enforcement waits on MLS membership.
+- **No read timeout** (final-review fix) — see the shared item below.
+- **Chunking was untested at scale.** The original test content was smaller
+  than one chunk, so it couldn't distinguish real chunking from a single giant
+  frame. Added `attachment_larger_than_one_chunk_reassembles_correctly`.
+
+### Task 10 (sequencer-routed joins) — fixes made
+
+- **Envelope/payload `space_id` confusion.** The routing `space_id` came from
+  the stream envelope while the payload carried its own, independently
+  peer-controlled one. A peer could route a space-B join request through
+  space-A's sequencer. The two must now agree or the request is dropped.
+- **Unbounded forwarding loops.** Two devices at different MLS epochs can each
+  elect the other as sequencer and forward the same request back and forth
+  forever, each hop spawning a fresh connection and task. Now capped by
+  `JoinRequest::MAX_HOPS`.
+- **Self-dial loop.** If membership resolved the elected sequencer to this
+  device's own `EndpointId` (while not matching its own `DeviceId`), the code
+  would dial itself and reprocess its own forward. Now dropped as a malformed
+  mapping.
+- **Redundant dial in `join_via_invite`.** It dialed the inviter
+  unconditionally even when already connected; now guarded, mirroring
+  `handle_join_request`.
+- **The forward path dials fresh.** This plan's closing note claimed the
+  forward "silently drops" when not already connected to the sequencer. That
+  was corrected during implementation *and* the closing note has now been
+  corrected above: the shipped code calls `dial_and_spawn`. What remains is
+  only the narrower liveness gap when that dial fails or its handshake doesn't
+  land inside the fixed 300 ms settle delay.
+- **No read timeout** (final-review fix) — see below.
+
+### Shared final-review fix: read timeouts on peer-driven handlers
+
+`serve_attachment_request`, `handle_join_request`, and `request_attachment` all
+called `read_frame` with no deadline, so a peer that opened a stream and sent
+nothing parked the handling task indefinitely. All three now go through
+`read_frame_timeout`, which applies `PEER_READ_TIMEOUT` (30 s per frame) and
+maps an elapsed deadline to `TransportError::Timeout`. This was never an
+unbounded DoS — QUIC's own concurrent-stream limits bound it — but a per-read
+deadline is cheap hardening. The bound is deliberately per-frame, not
+per-transfer, so a large-but-progressing attachment is never cut off, and it is
+deliberately *not* applied to `run_automerge_sync`'s reader task, whose stream
+is long-lived and legitimately idle between changes.
+
+### Known limitations deliberately deferred (not fixed in this milestone)
+
+These are documented in the source at the point they bite, and pinned by tests
+where the behavior is observable. **A test pinning a limitation going red is
+the expected signal that someone fixed it** — update the test and these notes
+together, don't work around it.
+
+- **L1 — A space registered after a connection exists never syncs over that
+  connection.** `exchange_digests` runs exactly once per connection,
+  immediately post-handshake, and that snapshot is frozen for the connection's
+  lifetime. Both the dialer's stream-opening decision and the accepter's epoch
+  gate consult it, so `add_space` for a new `space_id` after a connection is up
+  yields no sync over that connection — **in either direction, ever**, for as
+  long as it lives (and roaming survival deliberately makes connections
+  long-lived). Attachment transfer is hit by the same mechanism:
+  `serve_attachment_request`'s `remote_spaces` check is built from that same
+  snapshot, so an attachment request naming a late-registered space comes back
+  as not-found. Pinned by
+  `a_space_added_after_a_connection_exists_does_not_sync_over_it_known_limitation`.
+  **Milestone 4's composition root MUST account for this** — either register
+  every space *before* dialing or accepting any connection, or build
+  mid-connection digest re-negotiation before relying on dynamic space
+  registration. Re-negotiation is real design work (when to re-exchange, how to
+  avoid redundant streams, how to tear down streams for removed spaces) and was
+  out of scope for a review-fix pass.
+- **L2 — `conns` is keyed by `EndpointId` alone, breaking `Connected`/
+  `Disconnected` pairing under mutual/concurrent dial.** Two peers dialing each
+  other at once establish two independent connections; both insert under the
+  same key and both emit their own lifecycle events. A consumer can therefore
+  see `Connected` twice with no `Disconnected` between, and — in rarer timing —
+  the stored connection closing first evicts the `conns` entry while the other
+  connection is still live, making `request_attachment` return `NotFound`
+  against a healthy peer. (The `stable_id` guard only prevents the *other*
+  direction of this race: it stops a task evicting a newer connection's entry,
+  but cannot restore the survivor's entry once the stored one is gone.) Pinned
+  by `mutual_dial_can_emit_connected_twice_without_a_disconnected_known_limitation`.
+  A real fix means tracking possibly-multiple live connections per peer with
+  refcounted event emission.
+- **L3 — No shutdown/close API on `Transport`.** `Transport` exposes no
+  `close`/`shutdown`, and its background accept-loop task holds its own clone
+  of the `Arc`-backed `iroh::Endpoint`, so dropping a `Transport` value does
+  not tear down its endpoint, its accept loop, or any live connection. This is
+  already noted in the source (see
+  `dialer_reports_disconnected_only_after_the_peer_actually_disconnects`, which
+  drives a raw endpoint rather than a `Transport` precisely because of it); it
+  is recorded here so it lives alongside the other deferred gaps. Milestone 4
+  will need one for orderly app shutdown and for tests that want deterministic
+  teardown.
+- **L4 — Idle per-space streams are never closed.** The transport spec calls
+  for idle per-space stream sets to eventually be closed. Nothing implements
+  this: a sync stream opened at handshake lives for the whole connection.
+  Relatedly, `StreamManager`'s doc comment used to claim streams are opened
+  "lazily... only once a space becomes active" — that was never true of the
+  shipped code and has been corrected: `run_connection` opens an
+  `AutomergeSync` stream **eagerly** for **every** shared, same-epoch space
+  immediately at handshake time, regardless of activity. Worth addressing in a
+  follow-up if per-space stream count or resource usage becomes a real concern
+  at scale.
+- **L5 — Re-registering an existing `space_id` leaks its old sync tasks.**
+  Calling `add_space` again with the same key replaces the `SpaceEntry`
+  (segment and notify included) but does not cancel sync tasks already running
+  against the *old* segment/notify; they keep running against stale state until
+  their connection ends. Needs a real per-space cancellation mechanism
+  (generation counter or cancellation token). Documented on `add_space`.
+- **L6 — `addr_via_own_relay` is a test-topology workaround.** It
+  unconditionally attaches the *local* endpoint's own relay URL to a *remote*
+  peer's `EndpointAddr`, which is only correct in this crate's
+  single-shared-relay test topology. In a real multi-relay deployment the local
+  home relay is frequently not the remote peer's, and attaching it can seed a
+  misleading address instead of letting real discovery resolve a bare
+  `EndpointId`. Documented on the function itself.
+- **L7 — Fixed-delay settles instead of awaiting `Connected`.**
+  `join_via_invite` and `handle_join_request`'s forward path both
+  `sleep(300 ms)` after dialing rather than awaiting the `Connected` event.
+  Fine for this milestone's local-relay tests; a real implementation should
+  await the event.
 
