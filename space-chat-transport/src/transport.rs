@@ -259,7 +259,23 @@ async fn run_connection(
                     }
                     let guard = spaces.lock().await;
                     if let Some(entry) = guard.get(&envelope.space_id) {
-                        tokio::spawn(run_automerge_sync(handle, entry.segment.clone(), entry.notify.clone(), events.clone()));
+                        // Epoch check (review finding #1): mirror the
+                        // dialer branch's epoch gate above. Without this, an
+                        // incoming stream naming a locally-tracked
+                        // `space_id` would be synced regardless of whether
+                        // the remote peer is actually on the same epoch --
+                        // syncing mismatched-epoch segments against each
+                        // other is wrong for the same reason it's wrong on
+                        // the dialer side. If the epoch doesn't match, the
+                        // stream (and its `handle`) is simply dropped here
+                        // without being spawned; nothing reads or writes it
+                        // afterward, so it doesn't hang open -- the peer
+                        // that opened it will see it go idle/closed when
+                        // `handle` is dropped at the end of this iteration.
+                        let same_epoch = remote_digests.get(&envelope.space_id).map(|d| d.epoch) == Some(entry.epoch);
+                        if same_epoch {
+                            tokio::spawn(run_automerge_sync(handle, entry.segment.clone(), entry.notify.clone(), events.clone()));
+                        }
                     }
                 }
                 // Important #3 fix: only a `Connection`-variant error means
@@ -299,7 +315,6 @@ async fn run_automerge_sync(
     // `send` stays here for the main loop's writes.
     let crate::streams::StreamHandle { mut send, mut recv } = handle;
     let mut state = sync_state();
-    let mut last_emitted_cursor = segment.lock().await.latest_change().cursor;
 
     // Cancellation-safety fix (Critical #1): `read_frame` is built on two
     // sequential `read_exact` calls, which tokio's own docs document as NOT
@@ -350,8 +365,25 @@ async fn run_automerge_sync(
             frame = frame_rx.recv() => {
                 let Some(bytes) = frame else { return };
                 let Ok(msg) = automerge::sync::Message::decode(&bytes) else { continue };
+                // Review finding #2 fix: rather than comparing against a
+                // remembered cursor value (which a *different* sync task's
+                // purely-local mutation, or a sibling peer's successful
+                // merge, could have already bumped since this task last
+                // looked -- since `cursor` is a single counter shared across
+                // the whole `Segment`, not per-peer), check directly whether
+                // THIS `receive_sync_message` call actually merged new
+                // content, by comparing `heads()` immediately before and
+                // immediately after it, both while still holding the same
+                // lock guard so nothing else can mutate `seg` in between.
+                // `receive_sync_message` only merges what's contained in
+                // `msg`, so if heads are unchanged afterward, nothing new
+                // was incorporated as a result of receiving THIS message --
+                // whether because the peer sent something already known, or
+                // any other reason -- so there's genuinely nothing new to
+                // report from this receive.
                 let mut seg = segment.lock().await;
-                if seg.receive_sync_message(&mut state, msg).is_ok() {
+                let heads_before = seg.heads();
+                if seg.receive_sync_message(&mut state, msg).is_ok() && seg.heads() != heads_before {
                     // Important #9 (known, not fixed here): `latest_change`
                     // does a full Automerge document `save()` on every
                     // call, while `seg`'s lock is held -- a "deliberate
@@ -360,16 +392,19 @@ async fn run_automerge_sync(
                     // Milestone 1's design. A real scaling concern for
                     // long-lived spaces, not something to fix in this pass.
                     let change = seg.latest_change();
-                    if change.cursor > last_emitted_cursor {
-                        last_emitted_cursor = change.cursor;
-                        let _ = events.send(TransportEvent::IncomingChange(change));
-                        // Important #5 fix: wake any OTHER sync task for
-                        // this space (talking to a different peer) right
-                        // away instead of leaving it to its own up-to-200ms
-                        // poll -- makes multi-hop gossip propagation
-                        // actually push-driven, not purely polling.
-                        notify.notify_waiters();
-                    }
+                    let _ = events.send(TransportEvent::IncomingChange(change));
+                    // Important #5 fix: wake any OTHER sync task for this
+                    // space (talking to a different peer) right away
+                    // instead of leaving it to its own up-to-200ms poll.
+                    // This is best-effort push, not a guarantee:
+                    // `Notify::notify_waiters()` only wakes tasks currently
+                    // parked in `notified()` at the moment it's called -- a
+                    // sibling task that's mid-write (or not yet back around
+                    // to its `select!`) misses the wake and simply falls
+                    // back to its own 200ms poll floor, so propagation is
+                    // push-when-possible with a bounded polling fallback,
+                    // not guaranteed-instant.
+                    notify.notify_waiters();
                 }
             }
             _ = notify.notified() => {}
@@ -473,11 +508,20 @@ mod tests {
     /// `notify_local_change`. This leaves a real gap during which the
     /// per-space sync streams are alive and idle-polling (exchanging empty
     /// sync-protocol handshake frames) before there's any real content to
-    /// push -- exactly the situation where a `select!` cancellation of a
-    /// partially-read frame (Critical #1, if unfixed) has a real chance to
-    /// fire and desync the stream, and where the multi-hop
-    /// `notify_waiters()` wake (Important #5) actually matters instead of
-    /// being masked by the initial catch-up sync.
+    /// push. Honest scope of what this proves: it exercises the live-push /
+    /// `notify_waiters()` path structurally -- convergence works when
+    /// content is appended after the connection and sync streams are
+    /// already established, rather than only via initial catch-up sync --
+    /// and where the multi-hop `notify_waiters()` wake (Important #5)
+    /// actually gets a chance to matter instead of being masked by the
+    /// initial catch-up sync. It does NOT reliably force the exact
+    /// `select!`-cancels-a-partially-read-frame race that motivated the
+    /// Critical #1 cancellation-safety fix: the frames involved here are
+    /// small enough to complete within a single poll almost always, so this
+    /// test does not prove that specific timing window was hit, even though
+    /// the underlying reader-task/channel restructuring is correct
+    /// regardless, for the more fundamental cancellation-safety reasons
+    /// documented on `run_automerge_sync` above.
     #[tokio::test]
     async fn live_push_after_connection_is_established_converges() {
         let (relay_map, relay_url, _relay_server) =
