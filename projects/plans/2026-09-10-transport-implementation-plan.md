@@ -4,17 +4,18 @@
 
 > ## ⚠️ STALE CODE EXAMPLES — READ BEFORE USING THIS PLAN AS A REFERENCE
 >
-> **This plan has been implemented. The code examples embedded in Tasks 7, 9,
-> and 10 predate numerous real bugs found during implementation and do NOT
+> **This plan has been implemented. The code examples embedded in Tasks 6, 7,
+> 9, and 10 predate numerous real bugs found during implementation and do NOT
 > reflect the final, correct, shipped behavior.** They are preserved verbatim
 > as a record of the original design intent, not as a description of what the
 > crate does.
 >
 > **`space-chat-transport/src/` is authoritative. This document's embedded
-> code samples are not.** Copying Task 7/9/10's snippets as a design reference
-> would reintroduce this milestone's entire bug list — the lock-across-I/O
-> stall, the lock-order-inversion deadlock, the cancellation-unsafe
-> `read_frame`-in-`select!`, the asymmetric dialer/accepter accept loop, the
+> code samples are not.** Copying Task 6/7/9/10's snippets as a design
+> reference would reintroduce this milestone's entire bug list — the
+> falsely-"lazy" stream-opening doc comment, the lock-across-I/O stall, the
+> lock-order-inversion deadlock, the cancellation-unsafe `read_frame`-in-
+> `select!`, the asymmetric dialer/accepter accept loop, the
 > `Connected`-fired-before-handshake race, the `addr_via_own_relay` busy-spin
 > livelock, unbounded join-request forwarding, and more.
 >
@@ -22,7 +23,7 @@
 > the bottom of this document for what actually changed, and for the list of
 > known limitations that were deliberately deferred rather than fixed.
 
-**Goal:** Build `space-chat-transport` — a real `iroh`-based networking crate that lets two or more `space-chat-core` instances dial each other by endpoint ID, negotiate per-space activity over a connection-level control stream, exchange Automerge sync/gossip/MLS-control/ephemeral/attachment traffic over lazily-opened, prioritized, per-`(space_id, category)` QUIC streams, pair via a link/QR-encoded invite, and route invite-based joins through the space's elected sequencer — proven by two (and three, for the multi-hop scenario) separate OS processes converging over a local `iroh` test relay.
+**Goal:** Build `space-chat-transport` — a real `iroh`-based networking crate that lets two or more `space-chat-core` instances dial each other by endpoint ID, negotiate per-space activity over a connection-level control stream, exchange Automerge sync/gossip/MLS-control/ephemeral/attachment traffic over eagerly-opened, prioritized, per-`(space_id, category)` QUIC streams, pair via a link/QR-encoded invite, and route invite-based joins through the space's elected sequencer — proven by two (and three, for the multi-hop scenario) separate OS processes converging over a local `iroh` test relay.
 
 **Architecture:** One crate, `space-chat-transport`, not several. Unlike Milestone 2's storage crates (which split along genuinely different backend dependency trees — `redb` vs `tantivy` vs plain files, each independently swappable), every piece of transport — connection setup, control-stream digest exchange, per-space stream lifecycle, invite encoding, sequencer-routed joins — depends on the same `iroh` dependency and interoperates constantly within a single connection's lifecycle. Splitting it into multiple crates would be crate-boundary ceremony with no real isolation benefit, so it stays one crate with clear internal modules.
 
@@ -953,7 +954,20 @@ git commit -m "feat(transport): add connection-level control stream and per-spac
 
 ---
 
-### Task 6: Per-`(space_id, category)` stream manager, lazy open + prioritization
+### Task 6: Per-`(space_id, category)` stream manager, eager open + prioritization
+
+> **⚠️ Amendment (post-implementation):** this task's title and doc comment
+> below originally described streams as opened lazily — "only once a space
+> becomes active between two peers, not eagerly for every shared space
+> regardless of activity." That was never what shipped. `StreamManager`
+> itself owns no opening policy at all; its only caller,
+> `Transport::run_connection` (Task 7), opens an `AutomergeSync` stream
+> **eagerly** for **every** space present in both peers' registries at a
+> matching epoch, all at once, immediately after the handshake, regardless of
+> activity. Idle per-space streams are also never closed, despite the
+> transport spec calling for it. See
+> [Post-implementation amendments](#post-implementation-amendments) (L4);
+> `space-chat-transport/src/streams.rs` is authoritative.
 
 **Files:**
 - Create: `space-chat-transport/src/streams.rs`
@@ -1028,12 +1042,13 @@ pub struct StreamHandle {
 }
 
 /// Opens/accepts per-`(space_id, category)` streams on one already-
-/// established `iroh::endpoint::Connection`, lazily — per the transport
-/// spec, a stream set is opened only once a space becomes active between
-/// two peers, not eagerly for every shared space regardless of activity.
-/// This type owns no notion of *which* spaces are active; that policy
-/// decision belongs to `Transport` (Task 7), which calls `open` only for
-/// spaces `exchange_digests` (Task 5) found to have diverging heads.
+/// established `iroh::endpoint::Connection`. This type owns no notion of
+/// *which* spaces are active — it just opens whatever it is told to; that
+/// policy decision belongs to `Transport` (Task 7), which in the shipped
+/// code calls `open` **eagerly** for **every** space present in both
+/// peers' registries at a matching epoch, immediately after the handshake,
+/// regardless of activity (not lazily/only-on-divergence, as an earlier
+/// draft of this comment claimed).
 pub struct StreamManager {
     conn: iroh::endpoint::Connection,
 }
@@ -2840,16 +2855,17 @@ together, don't work around it.
   is recorded here so it lives alongside the other deferred gaps. Milestone 4
   will need one for orderly app shutdown and for tests that want deterministic
   teardown.
-- **L4 — Idle per-space streams are never closed.** The transport spec calls
-  for idle per-space stream sets to eventually be closed. Nothing implements
-  this: a sync stream opened at handshake lives for the whole connection.
-  Relatedly, `StreamManager`'s doc comment used to claim streams are opened
-  "lazily... only once a space becomes active" — that was never true of the
-  shipped code and has been corrected: `run_connection` opens an
-  `AutomergeSync` stream **eagerly** for **every** shared, same-epoch space
-  immediately at handshake time, regardless of activity. Worth addressing in a
-  follow-up if per-space stream count or resource usage becomes a real concern
-  at scale.
+- **L4 — Per-space streams are opened eagerly, not lazily, and are never
+  closed when idle.** The transport spec calls for a per-space stream set to
+  be opened lazily as spaces become active and closed when idle. Neither half
+  of that is what shipped: `run_connection` opens an `AutomergeSync` stream
+  **eagerly** for **every** shared, same-epoch space immediately at handshake
+  time, regardless of activity (not lazily, only once a space becomes
+  active); and once opened, a stream lives for the whole connection with
+  nothing to close it when idle. `StreamManager`'s doc comment (Task 6) used
+  to claim the lazy half was true — that was never the case for the shipped
+  code and has been corrected. Worth addressing both halves in a follow-up if
+  per-space stream count or resource usage becomes a real concern at scale.
 - **L5 — Re-registering an existing `space_id` leaks its old sync tasks.**
   Calling `add_space` again with the same key replaces the `SpaceEntry`
   (segment and notify included) but does not cancel sync tasks already running
