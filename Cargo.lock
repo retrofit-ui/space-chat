@@ -3792,6 +3792,7 @@ dependencies = [
 name = "space-chat-transport"
 version = "0.1.0"
 dependencies = [
+ "automerge",
  "ciborium",
  "iroh",
  "serde",
