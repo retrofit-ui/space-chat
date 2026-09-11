@@ -19,6 +19,28 @@ pub struct JoinRequest {
     pub space_id: String,
     pub joiner_endpoint_id: [u8; 32],
     pub payload: Vec<u8>,
+    /// Critical #2 fix: incremented by `handle_join_request` (in
+    /// `transport.rs`) each time this request is forwarded on to a newly
+    /// elected sequencer. Starts at `0` from `Transport::join_via_invite`.
+    /// The design assumes every peer computes the same sequencer for a
+    /// given space via `elect_sequencer`, so a request should normally
+    /// converge in one hop -- but two devices at different MLS-state
+    /// epochs can have different `members()` views and each elect the
+    /// OTHER as sequencer, forwarding the same request back and forth
+    /// forever. `handle_join_request` drops (rather than forwards) any
+    /// request whose `hops` has already reached `JoinRequest::MAX_HOPS`,
+    /// bounding the worst case.
+    pub hops: u8,
+}
+
+impl JoinRequest {
+    /// Upper bound on how many times a `JoinRequest` may be forwarded
+    /// between peers before it is dropped instead of forwarded further.
+    /// This is a P2P invite-join path (normally converging in a single
+    /// hop), not a general message-routing protocol, so a small constant
+    /// cap is generous headroom for the inconsistent-membership-views case
+    /// while still guaranteeing termination.
+    pub const MAX_HOPS: u8 = 3;
 }
 
 #[cfg(test)]
@@ -194,6 +216,183 @@ mod tests {
         assert!(
             !saw_join_request,
             "a space with no known members (elect_sequencer returns None) should never surface a JoinRequest event"
+        );
+    }
+
+    /// Critical #2 regression test (hop-count cap): the design assumes every
+    /// peer computes the same sequencer for a space via `elect_sequencer`,
+    /// so a normal join request converges in one forwarding hop. Two
+    /// devices with inconsistent membership views could otherwise forward
+    /// the same request back and forth forever. Rather than actually
+    /// constructing such a loop (which would require racing two diverging
+    /// `SpaceMembership` views and risks flakiness), this test proves the
+    /// termination mechanism directly: a `JoinRequest` already at
+    /// `JoinRequest::MAX_HOPS` must be DROPPED by a non-sequencer peer, not
+    /// forwarded on. `Transport::join_via_invite` always starts a fresh
+    /// request at `hops: 0`, so this test bypasses it and speaks the wire
+    /// protocol directly (mirroring the pattern `transport.rs`'s own
+    /// `dialer_reports_disconnected_only_after_the_peer_actually_disconnects`
+    /// test uses for a raw, non-`Transport` peer) in order to deliver a
+    /// `JoinRequest` whose `hops` field is already at the cap.
+    #[tokio::test]
+    async fn a_join_request_at_the_hop_cap_is_dropped_instead_of_forwarded() {
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+
+        // Device A has the lowest DeviceId -- it is the elected sequencer.
+        // Device B is deliberately NOT the sequencer, so absent the hop-cap
+        // fix it would forward the request on to A.
+        let device_a = DeviceId([1u8; 32]);
+        let device_b = DeviceId([2u8; 32]);
+
+        let a_identity = TransportIdentity::generate();
+        let b_identity = TransportIdentity::generate();
+
+        let (a, mut a_events) = Transport::bind(&a_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (b, _b_events) = Transport::bind(&b_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+
+        let endpoints = StdMutex::new(HashMap::from([
+            (device_a, a.endpoint_id()),
+            (device_b, b.endpoint_id()),
+        ]));
+        let membership: Arc<dyn SpaceMembership> = Arc::new(FakeMembership {
+            members: vec![device_a, device_b],
+            endpoints,
+        });
+
+        a.configure_membership(device_a, membership.clone()).await;
+        b.configure_membership(device_b, membership).await;
+
+        // A raw endpoint (not wrapped in a `Transport`) plays the role of a
+        // peer delivering a `JoinRequest` directly to B, over the same wire
+        // protocol `join_via_invite` uses, but with `hops` already at
+        // `JoinRequest::MAX_HOPS` -- something `join_via_invite` itself can
+        // never produce (it always starts at `hops: 0`).
+        let raw_identity = TransportIdentity::generate();
+        let raw_endpoint = crate::bootstrap::bind_endpoint(
+            &raw_identity,
+            TransportConfig { relay: Some((relay_map, relay_url)) },
+        )
+        .await
+        .unwrap();
+        let conn = raw_endpoint
+            .connect(b.endpoint_addr(), crate::bootstrap::ALPN)
+            .await
+            .unwrap();
+        // Speak just enough of the control-stream digest handshake (Task 5)
+        // to unblock B's accepter-side `run_connection` past
+        // `exchange_digests`, exactly like `join_via_invite`'s own
+        // connections do under the hood.
+        crate::control::exchange_digests(&conn, true, crate::control::ControlHello { digests: vec![] })
+            .await
+            .unwrap();
+
+        let manager = crate::streams::StreamManager::new(conn);
+        let mut handle = manager
+            .open("space-1", crate::envelope::Category::MlsControl)
+            .await
+            .unwrap();
+        let request = JoinRequest {
+            space_id: "space-1".to_string(),
+            joiner_endpoint_id: [7u8; 32],
+            payload: b"key package".to_vec(),
+            hops: JoinRequest::MAX_HOPS, // already at the cap
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&request, &mut bytes).unwrap();
+        crate::framing::write_frame(&mut handle.send, &bytes).await.unwrap();
+
+        let saw_join_request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match a_events.recv().await {
+                    Some(TransportEvent::JoinRequest(_)) => return true,
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            !saw_join_request,
+            "a JoinRequest already at JoinRequest::MAX_HOPS should be dropped by B (a non-sequencer), \
+             not forwarded on to A (the elected sequencer)"
+        );
+    }
+
+    /// Important I1 regression test: the stream envelope's `space_id` (used
+    /// to look up membership / elect the sequencer) and the `JoinRequest`
+    /// payload's own `space_id` field are two independently peer-controlled
+    /// values. A peer could set the envelope's `space_id` to name one space
+    /// (so routing/elect_sequencer uses that space's membership) while the
+    /// payload names a different one. This test delivers exactly that
+    /// mismatch directly to the elected sequencer (so it isn't even a
+    /// forwarding case) and confirms the request is dropped cleanly rather
+    /// than surfaced as a `TransportEvent::JoinRequest`.
+    #[tokio::test]
+    async fn a_join_request_with_mismatched_envelope_and_payload_space_id_is_dropped() {
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+
+        let device_a = DeviceId([1u8; 32]);
+        let a_identity = TransportIdentity::generate();
+        let (a, mut a_events) = Transport::bind(&a_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+
+        let endpoints = StdMutex::new(HashMap::from([(device_a, a.endpoint_id())]));
+        let membership: Arc<dyn SpaceMembership> = Arc::new(FakeMembership {
+            members: vec![device_a],
+            endpoints,
+        });
+        a.configure_membership(device_a, membership).await;
+
+        let raw_identity = TransportIdentity::generate();
+        let raw_endpoint = crate::bootstrap::bind_endpoint(
+            &raw_identity,
+            TransportConfig { relay: Some((relay_map, relay_url)) },
+        )
+        .await
+        .unwrap();
+        let conn = raw_endpoint
+            .connect(a.endpoint_addr(), crate::bootstrap::ALPN)
+            .await
+            .unwrap();
+        crate::control::exchange_digests(&conn, true, crate::control::ControlHello { digests: vec![] })
+            .await
+            .unwrap();
+
+        let manager = crate::streams::StreamManager::new(conn);
+        // The stream ENVELOPE names "space-envelope" -- this is what
+        // `handle_join_request` uses to look up membership and elect the
+        // sequencer (device A, above, is the sole/elected sequencer for
+        // every space_id `FakeMembership` is asked about).
+        let mut handle = manager
+            .open("space-envelope", crate::envelope::Category::MlsControl)
+            .await
+            .unwrap();
+        // The PAYLOAD names a different space, "space-payload".
+        let request = JoinRequest {
+            space_id: "space-payload".to_string(),
+            joiner_endpoint_id: [7u8; 32],
+            payload: b"key package".to_vec(),
+            hops: 0,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&request, &mut bytes).unwrap();
+        crate::framing::write_frame(&mut handle.send, &bytes).await.unwrap();
+
+        let saw_join_request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match a_events.recv().await {
+                    Some(TransportEvent::JoinRequest(_)) => return true,
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            !saw_join_request,
+            "a JoinRequest whose payload space_id disagrees with its stream envelope's space_id \
+             must be dropped, not surfaced as a JoinRequest event"
         );
     }
 }

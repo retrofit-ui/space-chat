@@ -336,16 +336,27 @@ impl Transport {
     ) -> Result<(), TransportError> {
         let inviter_id = iroh::EndpointId::from_bytes(&invite.endpoint_id)
             .map_err(|e| TransportError::Codec(e.to_string()))?;
-        self.dial(addr_via_own_relay(&self.endpoint, inviter_id).await).await?;
 
-        // `dial` spawns `run_connection` in the background; give the
-        // control-stream digest handshake a moment to complete and register
-        // the connection before looking it up. A production implementation
-        // would await a `Connected` event instead of sleeping -- left as a
-        // known simplification, since this plan's tests tolerate the fixed
-        // delay (the same pattern several Task 9 tests already use for the
-        // same reason).
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Important I4 fix: only dial if not already connected to the
+        // inviter -- mirrors the check `handle_join_request` already does
+        // before dialing the elected sequencer (see its own `conns.lock()...
+        // is_none()` guard below). Without this, `join_via_invite` dialed
+        // the inviter unconditionally even when a connection to them
+        // already existed, spawning a redundant second connection --
+        // survivable only because of the `stable_id`-based dedup guard in
+        // `run_connection`, but unnecessary and avoidable.
+        if self.conns.lock().await.get(&inviter_id).is_none() {
+            self.dial(addr_via_own_relay(&self.endpoint, inviter_id).await).await?;
+
+            // `dial` spawns `run_connection` in the background; give the
+            // control-stream digest handshake a moment to complete and
+            // register the connection before looking it up. A production
+            // implementation would await a `Connected` event instead of
+            // sleeping -- left as a known simplification, since this plan's
+            // tests tolerate the fixed delay (the same pattern several Task
+            // 9 tests already use for the same reason).
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
         let conn = self
             .conns
             .lock()
@@ -360,6 +371,7 @@ impl Transport {
             space_id: invite.space_id.clone(),
             joiner_endpoint_id: *self.endpoint_id().as_bytes(),
             payload,
+            hops: 0,
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&request, &mut bytes).map_err(|e| TransportError::Codec(e.to_string()))?;
@@ -367,26 +379,26 @@ impl Transport {
     }
 }
 
-/// Builds a dialable `EndpointAddr` for the bare `EndpointId` `id`,
-/// attaching whatever relay URL `endpoint` itself currently uses (if any).
+/// Builds a dialable `EndpointAddr` for the bare `EndpointId` `id` by
+/// attaching whatever relay URL `endpoint` -- i.e. THIS LOCAL device's own
+/// endpoint -- currently uses (if any).
 ///
-/// `Invite` deliberately carries only a bare `[u8; 32]` endpoint id (see its
-/// own doc comment) -- no relay/IP info. `EndpointAddr::from(EndpointId)`
-/// attaches none either, so dialing it directly fails with "No addressing
-/// information available" the moment discovery isn't configured to resolve
-/// it. That's exactly this crate's own `TransportConfig { relay: Some(..) }`
-/// deployment shape (`bootstrap.rs`'s "self-hosted local relay" preset,
-/// which deliberately disables discovery -- see its doc comment): there,
-/// the only address worth trying is whatever relay THIS device itself is
-/// already using, which is valid precisely because every device sharing
-/// that deployment shares one relay. A `relay: None` (production `N0`
-/// preset) deployment doesn't need this fallback at all -- its pkarr/DNS
-/// discovery resolves a bare `EndpointId` well before this function's
-/// best-effort guess would ever matter; this only fires when discovery
-/// found nothing (or isn't configured), same as the existing per-test
-/// pattern of manually attaching `.with_relay_url(..)` seen throughout this
-/// crate's own test suite, just made reusable at the `Transport` API
-/// surface for Task 10's join flow.
+/// Important I2 fix (doc correction, no behavior change): this function is
+/// called *unconditionally* at every call site (`join_via_invite`,
+/// `handle_join_request`'s forward-to-sequencer path) -- there is no check
+/// anywhere that discovery already failed or isn't configured before this
+/// runs. It unconditionally attaches the LOCAL endpoint's own relay URL to
+/// the REMOTE peer's `EndpointAddr`, which is only correct in this crate's
+/// own test topology, where every device shares exactly one relay
+/// (`bootstrap.rs`'s "self-hosted local relay" preset, which also disables
+/// discovery). In a real multi-relay or production deployment, the local
+/// endpoint's home relay is frequently NOT the remote peer's home relay --
+/// attaching it could seed a bad/misleading address for the remote peer
+/// rather than leaving a bare `EndpointId` for real discovery (pkarr/DNS
+/// under the `N0` preset) to resolve correctly on its own. In short: this is
+/// a test-topology-specific workaround for this crate's single-shared-relay
+/// deployment shape, not a general "falls back only when discovery comes up
+/// empty" mechanism -- callers outside that topology should not rely on it.
 async fn addr_via_own_relay(endpoint: &iroh::Endpoint, id: iroh::EndpointId) -> iroh::EndpointAddr {
     let mut addr = iroh::EndpointAddr::from(id);
     // `endpoint.addr()` is a plain snapshot -- right after `bind`, it can
@@ -406,8 +418,25 @@ async fn addr_via_own_relay(endpoint: &iroh::Endpoint, id: iroh::EndpointId) -> 
             addr = addr.with_relay_url(relay_url.clone());
             break;
         }
-        if tokio::time::timeout_at(deadline, watcher.updated()).await.is_err() {
-            break; // timed out or disconnected -- fall back to whatever `addr` already has
+        // Critical #1 fix: `timeout_at` only wraps the OUTER `Result` --
+        // `Err` means the deadline elapsed, but `Ok(Err(_))` means the
+        // watcher itself resolved (e.g. it disconnected because the
+        // endpoint is closing) WITHOUT timing out. `.is_err()` on the outer
+        // result alone missed that second case entirely. That's worse than
+        // a plain missed-break: once a `Watcher` is disconnected,
+        // `updated()` resolves to `Ready` on every single poll (it never
+        // goes `Pending` again), and `tokio::time::Timeout` polls its inner
+        // future before checking the deadline -- so the old code, on
+        // disconnect, looped back around, called `watcher.updated()` again,
+        // got `Ready` immediately again, and never yielded to the
+        // scheduler: a livelock pinning a tokio worker thread at 100% CPU
+        // rather than a bounded wait. Matching on BOTH the outer and inner
+        // `Result` explicitly makes "timed out" OR "watcher disconnected"
+        // break the loop either way, so this always terminates in bounded
+        // time (at most the 5s deadline) regardless of which happens.
+        match tokio::time::timeout_at(deadline, watcher.updated()).await {
+            Err(_) | Ok(Err(_)) => break, // timed out, OR the watcher disconnected
+            Ok(Ok(_)) => {} // got an update -- loop again to check for a relay URL
         }
     }
     addr
@@ -469,6 +498,18 @@ async fn handle_join_request(
     let Ok(bytes) = read_frame(&mut handle.recv).await else { return };
     let Ok(request): Result<JoinRequest, _> = ciborium::from_reader(bytes.as_slice()) else { return };
 
+    // Important I1 fix: `space_id` (this function's parameter) comes from
+    // the STREAM ENVELOPE and is used below to look up membership / elect
+    // the sequencer, while `request.space_id` is the PAYLOAD's own,
+    // independently peer-controlled field. A peer could set the envelope's
+    // space_id to name space-A (routing via space-A's membership/sequencer)
+    // while the request payload names space-B, so a space-B join request
+    // ends up routed/delivered via space-A's sequencer. Require the two to
+    // agree; drop the request otherwise rather than process or forward it.
+    if request.space_id != space_id {
+        return;
+    }
+
     // Destructured into `membership_source` (the `Arc<dyn SpaceMembership>`)
     // to avoid shadowing the outer `membership: Arc<Mutex<Option<...>>>`
     // parameter, which is still needed below to pass on to `dial_and_spawn`
@@ -484,6 +525,35 @@ async fn handle_join_request(
     }
 
     let Some(sequencer_endpoint) = membership_source.endpoint_for(sequencer) else { return };
+
+    // Critical #2 defensive fix: if the elected sequencer's endpoint
+    // resolves to THIS device's own `EndpointId`, even though `sequencer`
+    // is NOT this device's own `DeviceId` (already ruled out just above),
+    // the membership mapping is inconsistent/malformed -- dialing "the
+    // sequencer" here would actually mean dialing ourselves and then
+    // processing our own forwarded request, looping. Drop instead of
+    // dialing.
+    if sequencer_endpoint == endpoint.id() {
+        return;
+    }
+
+    // Critical #2 hop-count fix: the design assumes every peer computes the
+    // same sequencer for a given space via `elect_sequencer`, so forwarding
+    // converges in one hop. But two devices at different MLS-state epochs
+    // can have different `members()` views and each elect the OTHER as
+    // sequencer, forwarding the same request back and forth forever, each
+    // hop spawning a fresh connection/task with no termination. Cap the
+    // number of hops (`JoinRequest::MAX_HOPS`) and drop -- rather than
+    // forward again -- once reached.
+    if request.hops >= JoinRequest::MAX_HOPS {
+        return;
+    }
+    let mut forwarded_request = request;
+    forwarded_request.hops += 1;
+    let mut forward_bytes = Vec::new();
+    if ciborium::into_writer(&forwarded_request, &mut forward_bytes).is_err() {
+        return;
+    }
 
     // Not already connected to the sequencer? Dial it fresh, exactly like
     // `Transport::dial` would, then give the handshake a moment to land --
@@ -511,7 +581,7 @@ async fn handle_join_request(
     let Some(conn) = conn else { return }; // dial failed or handshake didn't land in time
     let manager = StreamManager::new(conn);
     if let Ok(mut forward_handle) = manager.open(&space_id, Category::MlsControl).await {
-        let _ = write_frame(&mut forward_handle.send, &bytes).await;
+        let _ = write_frame(&mut forward_handle.send, &forward_bytes).await;
     }
 }
 
