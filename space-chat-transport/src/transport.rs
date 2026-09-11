@@ -287,7 +287,6 @@ async fn run_connection(
     // = conn.remote_id() else { return }` doesn't compile against the real
     // API, so this calls it directly.
     let remote_id = conn.remote_id();
-    let _ = events.send(TransportEvent::Connected { endpoint_id: remote_id });
 
     let local_digests = {
         let guard = spaces.lock().await;
@@ -305,7 +304,15 @@ async fn run_connection(
         // succeeds), so there is nothing to remove here -- this early
         // return simply never having inserted is what makes this path
         // correct, not a compensating removal.
-        let _ = events.send(TransportEvent::Disconnected { endpoint_id: remote_id });
+        //
+        // Review fix (finding #1): no `Connected` has been sent for this
+        // connection either -- it's now only sent once the handshake
+        // below succeeds -- so this failure path must NOT send
+        // `Disconnected` here. Doing so would report a `Disconnected` for
+        // an `endpoint_id` a consumer was never told `Connected` about,
+        // breaking the invariant that every `Disconnected` pairs with a
+        // prior `Connected` (and vice versa). A handshake failure is
+        // simply never announced at all.
         return;
     };
     // Keyed by `space_id` (not a `HashSet<String>` of names) so the dialer
@@ -313,12 +320,15 @@ async fn run_connection(
     // this space_id" (Important #4 fix).
     let remote_digests: HashMap<String, SpaceDigest> =
         remote_hello.digests.into_iter().map(|d| (d.space_id.clone(), d)).collect();
-    // Important #5 fix: the set of space_ids the remote peer claims to
-    // share (from its own `ControlHello`), threaded into
+    // Important #5 fix: the set of space_ids the remote peer *claims* to
+    // share (self-asserted via its own `ControlHello`, with no membership
+    // proof -- see `serve_attachment_request`'s doc comment for why this is
+    // a best-effort check, not a security boundary), threaded into
     // `serve_attachment_request` so it can refuse to serve an attachment
-    // under a `space_id` the requester never proved it shares. `Arc`-wrapped
-    // so every `serve_attachment_request` task spawned below can cheaply
-    // clone a handle to the same set rather than cloning the set itself.
+    // under a `space_id` the requester didn't even claim to share.
+    // `Arc`-wrapped so every `serve_attachment_request` task spawned below
+    // can cheaply clone a handle to the same set rather than cloning the
+    // set itself.
     let remote_spaces: Arc<HashSet<String>> = Arc::new(remote_digests.keys().cloned().collect());
 
     // Important #4 fix: only make this connection visible to
@@ -330,6 +340,15 @@ async fn run_connection(
     // window could race with (and be misread as) the control stream's own
     // first stream on the accepting side.
     conns.lock().await.insert(remote_id, conn.clone());
+    // Review fix (finding #1): `Connected` is only announced here, AFTER
+    // the control-stream handshake has succeeded and `conns` has been
+    // populated -- i.e. once this connection is genuinely usable by a
+    // consumer reacting to the event (e.g. immediately calling
+    // `Transport::request_attachment`). Previously this fired right at
+    // the top of the function, before either had happened, so a consumer
+    // could race `request_attachment` against a `conns` entry that didn't
+    // exist yet and get a spurious `TransportError::NotFound`.
+    let _ = events.send(TransportEvent::Connected { endpoint_id: remote_id });
     // Important #3 fix: `stable_id()` (verified against `iroh` 1.2.0's
     // source, `src/endpoint/connection.rs` -- defined on the generic
     // `impl<T: ConnectionState> Connection<T>`, so it's available on this
@@ -451,11 +470,14 @@ async fn run_connection(
                     // any other peer: the handler below only ever answers
                     // from this process's own `attachments` map. Important
                     // #5 fix: `remote_spaces` (this connection's peer's own
-                    // claimed space_ids) and the requested `envelope.space_id`
-                    // are threaded through so the handler can refuse to
-                    // serve a hash under a space the requester never proved
-                    // it shares, rather than serving any hash to any
-                    // connected peer regardless of space membership.
+                    // *claimed* space_ids) and the requested `envelope.space_id`
+                    // are threaded through so the handler can refuse to serve
+                    // a hash under a space the requester didn't even claim to
+                    // share, rather than serving any hash to any connected
+                    // peer with no space check at all. See
+                    // `serve_attachment_request`'s doc comment for why this
+                    // is only a best-effort filter, not real cross-space
+                    // isolation, in this milestone.
                     tokio::spawn(serve_attachment_request(
                         handle,
                         attachments.clone(),
@@ -502,11 +524,12 @@ async fn run_connection(
 /// Serves one incoming attachment request: reads the requested hash, writes
 /// back either the content in fixed-size chunks followed by an empty
 /// terminator frame, or just the empty terminator if this device doesn't
-/// have that hash (or the requesting peer hasn't proven it shares
-/// `space_id` -- see the Important #5 fix below). Never relays the request
-/// to any other peer -- there is no code path here that could, which is the
-/// point (see `Transport::request_attachment`'s doc comment on
-/// direct-endpoint-only behavior).
+/// have that hash (or `remote_spaces` doesn't contain the requested
+/// `space_id` -- see the space-scoping comment below, and its important
+/// caveats). Never relays the request to any other peer -- there is no code
+/// path here that could, which is the point (see
+/// `Transport::request_attachment`'s doc comment on direct-endpoint-only
+/// behavior).
 async fn serve_attachment_request(
     mut handle: crate::streams::StreamHandle,
     attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
@@ -517,14 +540,34 @@ async fn serve_attachment_request(
     let Ok(hash): Result<[u8; 32], _> = hash_bytes.try_into() else { return };
 
     // Important #5 fix: `request_attachment`'s API takes a `space_id`,
-    // implying attachments are scoped to a shared space, but until this
-    // fix nothing enforced it -- any connected peer could fetch any hash
-    // in `attachments` regardless of which spaces it actually shares.
+    // implying attachments are scoped to a shared space, but until this fix
+    // nothing checked it at all -- any connected peer could fetch any hash
+    // in `attachments` regardless of which spaces it claimed to share.
     // `remote_spaces` is this connection's peer's own claimed space_ids
     // (from its `ControlHello`, computed once in `run_connection`); if
     // `space_id` isn't among them, this is treated exactly like "hash not
     // found" below (just the empty terminator frame), rather than silently
     // ignoring the space entirely.
+    //
+    // Review finding (honesty correction): despite the name, this is NOT a
+    // real cross-space authorization boundary in this milestone, for two
+    // separate reasons, either one of which is sufficient to defeat it:
+    //   1. `remote_spaces` comes entirely from the peer's own
+    //      `ControlHello`/`SpaceDigest`, which is self-asserted with no
+    //      membership proof whatsoever -- any peer can simply claim to be
+    //      in any `space_id` it likes. Real membership verification (MLS
+    //      group membership) is Task 10 and does not exist yet.
+    //   2. Even given a genuinely-verified `space_id`, the `attachments`
+    //      map (`HashMap<[u8; 32], Vec<u8>>`) has no space dimension at
+    //      all -- `serve_attachment` stores/looks up by hash only, with no
+    //      association to the space the content came from. So a peer that
+    //      *does* legitimately share space-1 could still fetch an
+    //      attachment that actually belongs to space-2, purely by naming
+    //      space-1 in its request envelope, because nothing here ties a
+    //      stored hash to the space it was attached to.
+    // This check is left in place as a harmless best-effort filter and a
+    // reasonable foundation for real enforcement once Task 10 lands, but it
+    // must not be read as providing actual cross-space isolation today.
     let bytes = if remote_spaces.contains(&space_id) {
         attachments.lock().await.get(&hash).cloned()
     } else {
