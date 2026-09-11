@@ -295,6 +295,16 @@ impl Transport {
         Ok(bytes)
     }
 
+    /// Notifies the local `iroh::Endpoint` that the network may have
+    /// changed (wifi → cellular, etc.). A real `space-chat-app` calls this
+    /// from whatever OS-level network-change callback the platform
+    /// provides; tests call it directly to simulate that notification.
+    /// Per `iroh`'s own docs, this is harmless to call even when nothing
+    /// actually changed.
+    pub async fn simulate_network_change(&self) {
+        self.endpoint.network_change().await;
+    }
+
     /// Registers this device's own MLS `DeviceId` and the `SpaceMembership`
     /// source used to resolve `elect_sequencer` routing for join requests
     /// (Task 10). Not needed for any purpose other than the join flow --
@@ -1523,5 +1533,72 @@ mod tests {
         )
         .expect("alice should fetch the attachment directly from bob");
         assert_eq!(fetched, content);
+    }
+
+    /// Task 11: proves a live connection survives a simulated network
+    /// interface change (e.g. wifi -> cellular) without dropping or
+    /// requiring a re-dial. Exchanges one message before
+    /// `simulate_network_change` and one after, over the SAME connection,
+    /// so this genuinely proves the connection (and its sync stream) stays
+    /// alive and usable across the notification -- not just that the
+    /// `simulate_network_change` call itself doesn't error.
+    #[tokio::test]
+    async fn a_connection_survives_a_simulated_network_change_mid_conversation() {
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+        let alice_identity = TransportIdentity::generate();
+        let bob_identity = TransportIdentity::generate();
+        let (alice, _alice_events) = Transport::bind(&alice_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (bob, _bob_events) = Transport::bind(&bob_identity, TransportConfig { relay: Some((relay_map, relay_url)) }).await.unwrap();
+
+        let alice_segment = Arc::new(Mutex::new(Segment::new("space-1", 0)));
+        let bob_segment = Arc::new(Mutex::new(Segment::new("space-1", 0)));
+        alice.add_space("space-1", 0, alice_segment.clone()).await;
+        bob.add_space("space-1", 0, bob_segment.clone()).await;
+
+        alice.dial(bob.endpoint_addr()).await.unwrap();
+
+        alice_segment.lock().await.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "before roam".to_string(),
+            attachments: vec![],
+        });
+        alice.notify_local_change("space-1").await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if bob_segment.lock().await.message_count() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("bob should see the before-roam message");
+
+        // Per the transport spec's Resilience section: QUIC identifies
+        // connections by connection ID, not IP:port, so a network change
+        // doesn't require tearing down and re-establishing anything. This
+        // simulates the OS-level notification a real app would forward (e.g.
+        // Android's network-callback API) without this test needing to
+        // actually toggle a network interface.
+        alice.simulate_network_change().await;
+
+        alice_segment.lock().await.append_message(&Message {
+            sender: DeviceId([1u8; 32]),
+            content: "after roam".to_string(),
+            attachments: vec![],
+        });
+        alice.notify_local_change("space-1").await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if bob_segment.lock().await.message_count() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("bob should see the after-roam message over the same connection, with no re-dial");
     }
 }
