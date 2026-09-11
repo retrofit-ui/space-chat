@@ -7,7 +7,7 @@ use crate::identity::TransportIdentity;
 use crate::streams::StreamManager;
 use space_chat_core::projection::SegmentChange;
 use space_chat_core::segment::{sync_state, Segment};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -53,6 +53,15 @@ fn change_hash_to_bytes(h: &automerge::ChangeHash) -> [u8; 32] {
 /// well under `framing::MAX_FRAME_LEN`, and means a large attachment is
 /// streamed incrementally rather than allocated/sent as one giant frame.
 const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Upper bound on the total size of an attachment `request_attachment` will
+/// accumulate before giving up. Review finding (Important #2): without a
+/// cap, a malicious or buggy peer could stream chunks indefinitely and OOM
+/// the requester. 100 MiB is a tunable constant sized for this milestone's
+/// expected attachment sizes, not a hard architectural limit -- a future
+/// milestone that needs larger attachments (or a negotiated per-request
+/// size bound) can raise this or make it configurable.
+const MAX_ATTACHMENT_SIZE: usize = 100 * 1024 * 1024;
 
 pub struct Transport {
     endpoint: iroh::Endpoint,
@@ -233,6 +242,16 @@ impl Transport {
             if chunk.is_empty() {
                 break;
             }
+            // Important #2 fix: check the cap BEFORE accumulating further,
+            // so a peer that keeps streaming chunks past `MAX_ATTACHMENT_SIZE`
+            // can't grow `bytes` without bound -- this bails out as soon as
+            // the next chunk would push the total over the cap, rather than
+            // only after already having appended it.
+            if bytes.len().saturating_add(chunk.len()) > MAX_ATTACHMENT_SIZE {
+                return Err(TransportError::Codec(
+                    "attachment exceeded the maximum accepted size".to_string(),
+                ));
+            }
             bytes.extend_from_slice(&chunk);
         }
         if bytes.is_empty() {
@@ -268,12 +287,6 @@ async fn run_connection(
     // = conn.remote_id() else { return }` doesn't compile against the real
     // API, so this calls it directly.
     let remote_id = conn.remote_id();
-    // Task 9 addition: track this connection by remote id so
-    // `Transport::request_attachment` can look up an already-established
-    // connection to a specific peer without dialing implicitly. Cheap
-    // `Clone` (see `conn_for_close` below for the same fact established by
-    // Task 7's fix).
-    conns.lock().await.insert(remote_id, conn.clone());
     let _ = events.send(TransportEvent::Connected { endpoint_id: remote_id });
 
     let local_digests = {
@@ -287,7 +300,11 @@ async fn run_connection(
     };
 
     let Ok(remote_hello) = exchange_digests(&conn, is_dialer, ControlHello { digests: local_digests }).await else {
-        conns.lock().await.remove(&remote_id);
+        // Important #4 fix: `conns` was never populated for this connection
+        // (the insert now happens below, only AFTER this handshake
+        // succeeds), so there is nothing to remove here -- this early
+        // return simply never having inserted is what makes this path
+        // correct, not a compensating removal.
         let _ = events.send(TransportEvent::Disconnected { endpoint_id: remote_id });
         return;
     };
@@ -296,21 +313,35 @@ async fn run_connection(
     // this space_id" (Important #4 fix).
     let remote_digests: HashMap<String, SpaceDigest> =
         remote_hello.digests.into_iter().map(|d| (d.space_id.clone(), d)).collect();
+    // Important #5 fix: the set of space_ids the remote peer claims to
+    // share (from its own `ControlHello`), threaded into
+    // `serve_attachment_request` so it can refuse to serve an attachment
+    // under a `space_id` the requester never proved it shares. `Arc`-wrapped
+    // so every `serve_attachment_request` task spawned below can cheaply
+    // clone a handle to the same set rather than cloning the set itself.
+    let remote_spaces: Arc<HashSet<String>> = Arc::new(remote_digests.keys().cloned().collect());
 
-    // Bug fix vs. the brief's example: `StreamManager` takes ownership of
-    // `conn` and exposes no way to observe the underlying connection's
-    // lifetime, so a clone is kept here purely to `.closed().await` on
-    // below. Without this, the dialer branch (which, unlike the accepter
-    // branch's `accept_next` loop, returns immediately after opening its
-    // handful of sync streams) would fall straight through to the
-    // `Disconnected` send at the bottom of this function while the
-    // connection -- and the sync tasks just spawned against it -- were
-    // still very much alive, firing a false "disconnected" event a few
-    // hundred microseconds after connecting. `iroh::endpoint::Connection`
-    // is a cheap `Clone` (documented as "may be cloned to obtain another
-    // handle to the same connection" in `iroh` 1.2.0's source), so this
-    // costs nothing.
-    let conn_for_close = conn.clone();
+    // Important #4 fix: only make this connection visible to
+    // `Transport::request_attachment` (via `conns`) once the control-stream
+    // handshake above has actually completed. Populating `conns` any
+    // earlier left a window where a caller could `request_attachment`
+    // against this connection before `exchange_digests` had claimed its
+    // control stream -- an attachment-transfer stream opened in that
+    // window could race with (and be misread as) the control stream's own
+    // first stream on the accepting side.
+    conns.lock().await.insert(remote_id, conn.clone());
+    // Important #3 fix: `stable_id()` (verified against `iroh` 1.2.0's
+    // source, `src/endpoint/connection.rs` -- defined on the generic
+    // `impl<T: ConnectionState> Connection<T>`, so it's available on this
+    // plain `Connection`) is "a stable identifier for this connection...
+    // fixed for the lifetime of the connection" even though "peer
+    // addresses and connection IDs can change." Captured now, before
+    // `conn` is moved into `StreamManager`, so the removal at the bottom of
+    // this function can tell whether the `conns` entry still stored under
+    // `remote_id` is THIS task's own connection, or some other (newer)
+    // connection to the same peer that has since replaced it in a
+    // reconnect race -- in which case this task must NOT remove it.
+    let conn_stable_id = conn.stable_id();
     let manager = Arc::new(StreamManager::new(conn));
 
     // Deliberate scope simplification: this plan uses the single
@@ -361,86 +392,144 @@ async fn run_connection(
                 tokio::spawn(run_automerge_sync(handle, segment, notify, events.clone()));
             }
         }
-        // Block here for the connection's actual lifetime -- see the
-        // `conn_for_close` comment above for why this is necessary on the
-        // dialer side specifically.
-        conn_for_close.closed().await;
-    } else {
-        loop {
-            match manager.accept_next().await {
-                Ok((envelope, handle)) => match envelope.category {
-                    Category::AutomergeSync => {
-                        let guard = spaces.lock().await;
-                        if let Some(entry) = guard.get(&envelope.space_id) {
-                            // Epoch check (review finding #1): mirror the
-                            // dialer branch's epoch gate above. Without this, an
-                            // incoming stream naming a locally-tracked
-                            // `space_id` would be synced regardless of whether
-                            // the remote peer is actually on the same epoch --
-                            // syncing mismatched-epoch segments against each
-                            // other is wrong for the same reason it's wrong on
-                            // the dialer side. If the epoch doesn't match, the
-                            // stream (and its `handle`) is simply dropped here
-                            // without being spawned; nothing reads or writes it
-                            // afterward, so it doesn't hang open -- the peer
-                            // that opened it will see it go idle/closed when
-                            // `handle` is dropped at the end of this iteration.
-                            let same_epoch = remote_digests.get(&envelope.space_id).map(|d| d.epoch) == Some(entry.epoch);
-                            if same_epoch {
-                                tokio::spawn(run_automerge_sync(handle, entry.segment.clone(), entry.notify.clone(), events.clone()));
-                            }
+    }
+
+    // Important #1 fix: this accept loop now runs for BOTH roles, not just
+    // the accepter. Previously the dialer branch (above) opened its sync
+    // streams and then just blocked on the connection's own `.closed()`,
+    // never calling `accept_next()` -- so if the *dialer* side of a
+    // connection was asked (via `conns`, which is populated for both
+    // roles) to serve an `AttachmentTransfer` request, the requester's
+    // `manager.open()` would succeed (QUIC permits opening a stream in
+    // either direction once connected) but the dialer would never accept
+    // it, hanging the requester's `read_frame` forever. Since QUIC
+    // connections are bidirectional once established, and Automerge sync
+    // streams only need to be *opened* by one side (the same bidirectional
+    // stream serves both directions of sync once opened -- the dialer-only
+    // block above), there is no remaining reason for the dialer and
+    // accepter to run different loops after that point: both now dispatch
+    // whatever the peer opens, symmetrically.
+    //
+    // This also replaces the old `conn_for_close.closed().await` workaround
+    // that Task 7 added purely so the dialer branch had *something* to
+    // block on for the connection's lifetime (it used to return
+    // immediately after opening its sync streams, firing a false
+    // `Disconnected` on an otherwise-healthy connection). `accept_next`'s
+    // underlying `accept_bi()` blocks until either a stream arrives or the
+    // connection itself ends (surfacing as `Err(TransportError::Connection(_))`
+    // in the latter case) -- exactly the same "block until this connection
+    // ends" behavior `.closed()` provided, so nothing is lost by removing
+    // it, and the dialer now also gets to observe incoming streams, which
+    // is the whole point of this fix.
+    loop {
+        match manager.accept_next().await {
+            Ok((envelope, handle)) => match envelope.category {
+                Category::AutomergeSync => {
+                    let guard = spaces.lock().await;
+                    if let Some(entry) = guard.get(&envelope.space_id) {
+                        // Epoch check (review finding #1): mirror the
+                        // dialer-side epoch gate above. Without this, an
+                        // incoming stream naming a locally-tracked
+                        // `space_id` would be synced regardless of whether
+                        // the remote peer is actually on the same epoch --
+                        // syncing mismatched-epoch segments against each
+                        // other is wrong for the same reason it's wrong on
+                        // the dialer side. If the epoch doesn't match, the
+                        // stream (and its `handle`) is simply dropped here
+                        // without being spawned; nothing reads or writes it
+                        // afterward, so it doesn't hang open -- the peer
+                        // that opened it will see it go idle/closed when
+                        // `handle` is dropped at the end of this iteration.
+                        let same_epoch = remote_digests.get(&envelope.space_id).map(|d| d.epoch) == Some(entry.epoch);
+                        if same_epoch {
+                            tokio::spawn(run_automerge_sync(handle, entry.segment.clone(), entry.notify.clone(), events.clone()));
                         }
                     }
-                    Category::AttachmentTransfer => {
-                        // Task 9: serve one attachment request. Deliberately
-                        // does not consult `spaces`/`remote_digests` at all --
-                        // attachment bytes are addressed purely by content
-                        // hash (see `serve_attachment_request` below), not
-                        // gated by space membership/epoch the way sync
-                        // streams are. Never relays to any other peer: the
-                        // handler below only ever answers from this
-                        // process's own `attachments` map.
-                        tokio::spawn(serve_attachment_request(handle, attachments.clone()));
-                    }
-                    // MlsControl (Task 10), Gossip, Ephemeral: not opened by
-                    // this milestone's implementation (see this function's
-                    // earlier comment on Gossip) or handled by a later task.
-                    Category::MlsControl | Category::Gossip | Category::Ephemeral => {}
-                },
-                // Important #3 fix: only a `Connection`-variant error means
-                // the connection itself is gone (see `streams.rs`'s
-                // `accept_next` -- `accept_bi()` failures map to this
-                // variant). Any other error (`Io`/`Codec`, from a bad
-                // stream header) means just ONE stream from a misbehaving
-                // peer was malformed; the connection is still healthy, so
-                // skip that stream attempt and keep accepting instead of
-                // tearing down the whole connection and firing a false
-                // `Disconnected`.
-                Err(TransportError::Connection(_)) => break,
-                Err(_) => continue,
-            }
+                }
+                Category::AttachmentTransfer => {
+                    // Task 9: serve one attachment request. Never relays to
+                    // any other peer: the handler below only ever answers
+                    // from this process's own `attachments` map. Important
+                    // #5 fix: `remote_spaces` (this connection's peer's own
+                    // claimed space_ids) and the requested `envelope.space_id`
+                    // are threaded through so the handler can refuse to
+                    // serve a hash under a space the requester never proved
+                    // it shares, rather than serving any hash to any
+                    // connected peer regardless of space membership.
+                    tokio::spawn(serve_attachment_request(
+                        handle,
+                        attachments.clone(),
+                        remote_spaces.clone(),
+                        envelope.space_id,
+                    ));
+                }
+                // MlsControl (Task 10), Gossip, Ephemeral: not opened by
+                // this milestone's implementation (see this function's
+                // earlier comment on Gossip) or handled by a later task.
+                Category::MlsControl | Category::Gossip | Category::Ephemeral => {}
+            },
+            // Important #3 fix: only a `Connection`-variant error means
+            // the connection itself is gone (see `streams.rs`'s
+            // `accept_next` -- `accept_bi()` failures map to this
+            // variant). Any other error (`Io`/`Codec`, from a bad
+            // stream header) means just ONE stream from a misbehaving
+            // peer was malformed; the connection is still healthy, so
+            // skip that stream attempt and keep accepting instead of
+            // tearing down the whole connection and firing a false
+            // `Disconnected`.
+            Err(TransportError::Connection(_)) => break,
+            Err(_) => continue,
         }
     }
 
-    conns.lock().await.remove(&remote_id);
+    // Important #3 fix: don't blindly `remove` -- a reconnect race could
+    // mean a *different*, newer connection to this same `remote_id` has
+    // already been inserted into `conns` by another `run_connection` task
+    // by the time this one's accept loop exits. Compare `stable_id()`
+    // (captured before `conn` was moved into `manager`, above) against
+    // whatever connection is currently stored under `remote_id`, and only
+    // remove the entry if it's still THIS task's own connection --
+    // otherwise leave the newer connection's entry alone.
+    {
+        let mut guard = conns.lock().await;
+        if guard.get(&remote_id).map(|c| c.stable_id()) == Some(conn_stable_id) {
+            guard.remove(&remote_id);
+        }
+    }
     let _ = events.send(TransportEvent::Disconnected { endpoint_id: remote_id });
 }
 
 /// Serves one incoming attachment request: reads the requested hash, writes
 /// back either the content in fixed-size chunks followed by an empty
 /// terminator frame, or just the empty terminator if this device doesn't
-/// have that hash. Never relays the request to any other peer -- there is
-/// no code path here that could, which is the point (see
-/// `Transport::request_attachment`'s doc comment on direct-endpoint-only
-/// behavior).
+/// have that hash (or the requesting peer hasn't proven it shares
+/// `space_id` -- see the Important #5 fix below). Never relays the request
+/// to any other peer -- there is no code path here that could, which is the
+/// point (see `Transport::request_attachment`'s doc comment on
+/// direct-endpoint-only behavior).
 async fn serve_attachment_request(
     mut handle: crate::streams::StreamHandle,
     attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+    remote_spaces: Arc<HashSet<String>>,
+    space_id: String,
 ) {
     let Ok(hash_bytes) = read_frame(&mut handle.recv).await else { return };
     let Ok(hash): Result<[u8; 32], _> = hash_bytes.try_into() else { return };
 
-    let bytes = attachments.lock().await.get(&hash).cloned();
+    // Important #5 fix: `request_attachment`'s API takes a `space_id`,
+    // implying attachments are scoped to a shared space, but until this
+    // fix nothing enforced it -- any connected peer could fetch any hash
+    // in `attachments` regardless of which spaces it actually shares.
+    // `remote_spaces` is this connection's peer's own claimed space_ids
+    // (from its `ControlHello`, computed once in `run_connection`); if
+    // `space_id` isn't among them, this is treated exactly like "hash not
+    // found" below (just the empty terminator frame), rather than silently
+    // ignoring the space entirely.
+    let bytes = if remote_spaces.contains(&space_id) {
+        attachments.lock().await.get(&hash).cloned()
+    } else {
+        None
+    };
     if let Some(bytes) = bytes {
         for chunk in bytes.chunks(ATTACHMENT_CHUNK_SIZE) {
             if write_frame(&mut handle.send, chunk).await.is_err() {
@@ -974,6 +1063,69 @@ mod tests {
             .await
             .expect("bob should fetch the multi-chunk attachment directly from alice");
         assert_eq!(fetched.len(), content.len());
+        assert_eq!(fetched, content);
+    }
+
+    /// Regression test for Important #1: before the fix, `run_connection`
+    /// had two asymmetric branches -- the DIALER branch opened its
+    /// `AutomergeSync` streams up front and then just blocked on
+    /// `conn_for_close.closed().await`, never calling `manager.accept_next()`.
+    /// Only the accepter branch ran an `accept_next()` loop that could
+    /// receive an incoming `AttachmentTransfer` stream. Since `conns` (the
+    /// map `request_attachment` looks peers up in) is populated for BOTH
+    /// roles, a peer could ask the DIALER-role side of a connection for an
+    /// attachment: `manager.open()` on the requester's side would succeed
+    /// (QUIC permits opening a stream in either direction once connected),
+    /// but the dialer would never accept it, and the requester's
+    /// `read_frame` would hang forever.
+    ///
+    /// Here, bob dials alice (so alice is the ACCEPTER and bob is the
+    /// DIALER for this connection), and then ALICE -- the accepter --
+    /// requests an attachment FROM bob -- the dialer. This is exactly the
+    /// direction that used to hang. The whole exchange is wrapped in a
+    /// generous timeout so that if this regresses, the test fails cleanly
+    /// instead of hanging the test suite.
+    #[tokio::test]
+    async fn accepter_can_request_an_attachment_from_the_dialer() {
+        use sha2::{Digest, Sha256};
+
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+        let alice_identity = TransportIdentity::generate();
+        let bob_identity = TransportIdentity::generate();
+        let (alice, _alice_events) = Transport::bind(&alice_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (bob, _bob_events) = Transport::bind(&bob_identity, TransportConfig { relay: Some((relay_map, relay_url)) }).await.unwrap();
+
+        alice.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+        bob.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+
+        let content = b"an attachment that only the dialer-role peer holds".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let hash: [u8; 32] = hasher.finalize().into();
+        // Registered on BOB -- the peer that will be in the DIALER role
+        // below (bob.dial(alice)).
+        bob.serve_attachment(hash, content.clone()).await;
+
+        // Bob dials alice: bob is the dialer, alice is the accepter for
+        // this connection.
+        bob.dial(alice.endpoint_addr()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Alice -- the ACCEPTER -- asks bob -- the DIALER -- for the
+        // attachment. Before the Important #1 fix, bob's `run_connection`
+        // task never ran an `accept_next()` loop, so this would hang
+        // forever; the timeout below turns that into a clean test failure
+        // rather than an actual hang.
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(10),
+            alice.request_attachment("space-1", hash, bob.endpoint_id()),
+        )
+        .await
+        .expect(
+            "alice's request_attachment to the dialer-role peer should not hang -- \
+             this is exactly the direction Important #1's fix addresses",
+        )
+        .expect("alice should fetch the attachment directly from bob");
         assert_eq!(fetched, content);
     }
 }
