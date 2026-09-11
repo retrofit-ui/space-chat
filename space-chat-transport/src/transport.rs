@@ -48,9 +48,27 @@ fn change_hash_to_bytes(h: &automerge::ChangeHash) -> [u8; 32] {
     bytes
 }
 
+/// Chunk size used when streaming attachment bytes back to a requester
+/// (`serve_attachment_request`). Keeps any single attachment-transfer frame
+/// well under `framing::MAX_FRAME_LEN`, and means a large attachment is
+/// streamed incrementally rather than allocated/sent as one giant frame.
+const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
+
 pub struct Transport {
     endpoint: iroh::Endpoint,
     spaces: Arc<Mutex<HashMap<String, SpaceEntry>>>,
+    /// Live connections by remote `EndpointId`, populated/removed by
+    /// `run_connection`. `request_attachment` looks up an already-tracked
+    /// connection here rather than dialing implicitly -- this is what makes
+    /// attachment transfer structurally direct-endpoint-only (see its doc
+    /// comment below): there is no path from a hash lookup to "try some
+    /// other peer instead."
+    conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
+    /// This device's own copies of attachment bytes, keyed by content hash,
+    /// available to serve to any peer that asks for them directly. See
+    /// `serve_attachment`'s doc comment for why this stays an in-memory map
+    /// rather than depending on Milestone 2's `AttachmentBlobStore`.
+    attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
 }
 
@@ -62,8 +80,17 @@ impl Transport {
         let endpoint = bind_endpoint(identity, config).await?;
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let spaces: Arc<Mutex<HashMap<String, SpaceEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        let transport = Self { endpoint: endpoint.clone(), spaces: spaces.clone(), events_tx: events_tx.clone() };
+        let transport = Self {
+            endpoint: endpoint.clone(),
+            spaces: spaces.clone(),
+            conns: conns.clone(),
+            attachments: attachments.clone(),
+            events_tx: events_tx.clone(),
+        };
 
         // Background accept loop: every inbound connection gets its own
         // per-connection task, mirroring what `dial` (below) does for
@@ -72,7 +99,14 @@ impl Transport {
             loop {
                 let Some(incoming) = endpoint.accept().await else { break };
                 let Ok(conn) = incoming.await else { continue };
-                tokio::spawn(run_connection(conn, false, spaces.clone(), events_tx.clone()));
+                tokio::spawn(run_connection(
+                    conn,
+                    false,
+                    spaces.clone(),
+                    conns.clone(),
+                    attachments.clone(),
+                    events_tx.clone(),
+                ));
             }
         });
 
@@ -129,7 +163,14 @@ impl Transport {
             .connect(addr, ALPN)
             .await
             .map_err(|e| TransportError::Connection(e.to_string()))?;
-        tokio::spawn(run_connection(conn, true, self.spaces.clone(), self.events_tx.clone()));
+        tokio::spawn(run_connection(
+            conn,
+            true,
+            self.spaces.clone(),
+            self.conns.clone(),
+            self.attachments.clone(),
+            self.events_tx.clone(),
+        ));
         Ok(())
     }
 
@@ -142,12 +183,81 @@ impl Transport {
             entry.notify.notify_waiters();
         }
     }
+
+    /// Registers `bytes` as this device's copy of the attachment content-
+    /// addressed by `hash`, available to serve to any peer that requests it
+    /// by hash over an already-established connection. A real integration
+    /// (Milestone 4) would back this with Milestone 2's
+    /// `AttachmentBlobStore` rather than an in-memory map; this crate stays
+    /// free of that dependency (per Global Constraints) and exposes the
+    /// minimal surface a future integration plugs into.
+    pub async fn serve_attachment(&self, hash: [u8; 32], bytes: Vec<u8>) {
+        self.attachments.lock().await.insert(hash, bytes);
+    }
+
+    /// Requests attachment bytes directly from `from` -- no relaying
+    /// through any other connected peer is attempted, even if some other
+    /// peer happens to also have a connection to `from`. This method
+    /// deliberately does **not** implicitly `dial` -- it looks up an
+    /// already-tracked connection to `from` (populated by `run_connection`
+    /// below) and fails with `TransportError::NotFound` if none exists,
+    /// which is exactly what makes "attachments are strictly
+    /// direct-endpoint, not multi-hop" a structural property of this API
+    /// rather than an unexercised code path (see Task 8's multi-hop test,
+    /// which never dials the peer it fetches no attachment from). Verifies
+    /// the received bytes against `hash` before returning them, so a peer
+    /// that returns wrong/corrupt content is caught here rather than
+    /// silently handed to the caller.
+    pub async fn request_attachment(
+        &self,
+        space_id: &str,
+        hash: [u8; 32],
+        from: iroh::EndpointId,
+    ) -> Result<Vec<u8>, TransportError> {
+        let conn = self.conns.lock().await.get(&from).cloned().ok_or(TransportError::NotFound)?;
+        let manager = StreamManager::new(conn);
+        let mut handle = manager.open(space_id, Category::AttachmentTransfer).await?;
+        write_frame(&mut handle.send, &hash).await?;
+
+        // Straightforward request/response over one dedicated stream: no
+        // `select!` needed here (nothing else this call must race against),
+        // so `read_frame`'s non-cancellation-safety (see
+        // `run_automerge_sync`'s comment on the same function) simply
+        // doesn't apply -- this call either runs a `read_frame` to
+        // completion or the whole `request_attachment` future is dropped,
+        // in which case there's no partial state left for anything else to
+        // observe.
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = read_frame(&mut handle.recv).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err(TransportError::NotFound);
+        }
+
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes);
+        let actual: [u8; 32] = hasher.finalize().into();
+        if actual != hash {
+            return Err(TransportError::Codec(
+                "received attachment content did not match its requested hash".to_string(),
+            ));
+        }
+        Ok(bytes)
+    }
 }
 
 async fn run_connection(
     conn: iroh::endpoint::Connection,
     is_dialer: bool,
     spaces: Arc<Mutex<HashMap<String, SpaceEntry>>>,
+    conns: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
+    attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
     events: mpsc::UnboundedSender<TransportEvent>,
 ) {
     // Adaptation vs. the brief: verified against `iroh` 1.2.0's source
@@ -158,6 +268,12 @@ async fn run_connection(
     // = conn.remote_id() else { return }` doesn't compile against the real
     // API, so this calls it directly.
     let remote_id = conn.remote_id();
+    // Task 9 addition: track this connection by remote id so
+    // `Transport::request_attachment` can look up an already-established
+    // connection to a specific peer without dialing implicitly. Cheap
+    // `Clone` (see `conn_for_close` below for the same fact established by
+    // Task 7's fix).
+    conns.lock().await.insert(remote_id, conn.clone());
     let _ = events.send(TransportEvent::Connected { endpoint_id: remote_id });
 
     let local_digests = {
@@ -171,6 +287,7 @@ async fn run_connection(
     };
 
     let Ok(remote_hello) = exchange_digests(&conn, is_dialer, ControlHello { digests: local_digests }).await else {
+        conns.lock().await.remove(&remote_id);
         let _ = events.send(TransportEvent::Disconnected { endpoint_id: remote_id });
         return;
     };
@@ -251,33 +368,45 @@ async fn run_connection(
     } else {
         loop {
             match manager.accept_next().await {
-                Ok((envelope, handle)) => {
-                    if envelope.category != Category::AutomergeSync {
-                        // Other categories (MlsControl, AttachmentTransfer, ...)
-                        // are dispatched by Tasks 9/10's revisions of this loop.
-                        continue;
-                    }
-                    let guard = spaces.lock().await;
-                    if let Some(entry) = guard.get(&envelope.space_id) {
-                        // Epoch check (review finding #1): mirror the
-                        // dialer branch's epoch gate above. Without this, an
-                        // incoming stream naming a locally-tracked
-                        // `space_id` would be synced regardless of whether
-                        // the remote peer is actually on the same epoch --
-                        // syncing mismatched-epoch segments against each
-                        // other is wrong for the same reason it's wrong on
-                        // the dialer side. If the epoch doesn't match, the
-                        // stream (and its `handle`) is simply dropped here
-                        // without being spawned; nothing reads or writes it
-                        // afterward, so it doesn't hang open -- the peer
-                        // that opened it will see it go idle/closed when
-                        // `handle` is dropped at the end of this iteration.
-                        let same_epoch = remote_digests.get(&envelope.space_id).map(|d| d.epoch) == Some(entry.epoch);
-                        if same_epoch {
-                            tokio::spawn(run_automerge_sync(handle, entry.segment.clone(), entry.notify.clone(), events.clone()));
+                Ok((envelope, handle)) => match envelope.category {
+                    Category::AutomergeSync => {
+                        let guard = spaces.lock().await;
+                        if let Some(entry) = guard.get(&envelope.space_id) {
+                            // Epoch check (review finding #1): mirror the
+                            // dialer branch's epoch gate above. Without this, an
+                            // incoming stream naming a locally-tracked
+                            // `space_id` would be synced regardless of whether
+                            // the remote peer is actually on the same epoch --
+                            // syncing mismatched-epoch segments against each
+                            // other is wrong for the same reason it's wrong on
+                            // the dialer side. If the epoch doesn't match, the
+                            // stream (and its `handle`) is simply dropped here
+                            // without being spawned; nothing reads or writes it
+                            // afterward, so it doesn't hang open -- the peer
+                            // that opened it will see it go idle/closed when
+                            // `handle` is dropped at the end of this iteration.
+                            let same_epoch = remote_digests.get(&envelope.space_id).map(|d| d.epoch) == Some(entry.epoch);
+                            if same_epoch {
+                                tokio::spawn(run_automerge_sync(handle, entry.segment.clone(), entry.notify.clone(), events.clone()));
+                            }
                         }
                     }
-                }
+                    Category::AttachmentTransfer => {
+                        // Task 9: serve one attachment request. Deliberately
+                        // does not consult `spaces`/`remote_digests` at all --
+                        // attachment bytes are addressed purely by content
+                        // hash (see `serve_attachment_request` below), not
+                        // gated by space membership/epoch the way sync
+                        // streams are. Never relays to any other peer: the
+                        // handler below only ever answers from this
+                        // process's own `attachments` map.
+                        tokio::spawn(serve_attachment_request(handle, attachments.clone()));
+                    }
+                    // MlsControl (Task 10), Gossip, Ephemeral: not opened by
+                    // this milestone's implementation (see this function's
+                    // earlier comment on Gossip) or handled by a later task.
+                    Category::MlsControl | Category::Gossip | Category::Ephemeral => {}
+                },
                 // Important #3 fix: only a `Connection`-variant error means
                 // the connection itself is gone (see `streams.rs`'s
                 // `accept_next` -- `accept_bi()` failures map to this
@@ -293,7 +422,33 @@ async fn run_connection(
         }
     }
 
+    conns.lock().await.remove(&remote_id);
     let _ = events.send(TransportEvent::Disconnected { endpoint_id: remote_id });
+}
+
+/// Serves one incoming attachment request: reads the requested hash, writes
+/// back either the content in fixed-size chunks followed by an empty
+/// terminator frame, or just the empty terminator if this device doesn't
+/// have that hash. Never relays the request to any other peer -- there is
+/// no code path here that could, which is the point (see
+/// `Transport::request_attachment`'s doc comment on direct-endpoint-only
+/// behavior).
+async fn serve_attachment_request(
+    mut handle: crate::streams::StreamHandle,
+    attachments: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+) {
+    let Ok(hash_bytes) = read_frame(&mut handle.recv).await else { return };
+    let Ok(hash): Result<[u8; 32], _> = hash_bytes.try_into() else { return };
+
+    let bytes = attachments.lock().await.get(&hash).cloned();
+    if let Some(bytes) = bytes {
+        for chunk in bytes.chunks(ATTACHMENT_CHUNK_SIZE) {
+            if write_frame(&mut handle.send, chunk).await.is_err() {
+                return;
+            }
+        }
+    }
+    let _ = write_frame(&mut handle.send, &[]).await;
 }
 
 /// Runs one space's sync-message exchange against one peer, for the
@@ -738,5 +893,87 @@ mod tests {
              test guards against (the dialer branch reporting Disconnected right after opening \
              sync streams instead of waiting for the connection to actually end)"
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_transfer_is_direct_endpoint_only_and_hash_verified() {
+        use sha2::{Digest, Sha256};
+
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+        let alice_identity = TransportIdentity::generate();
+        let bob_identity = TransportIdentity::generate();
+        let (alice, _alice_events) = Transport::bind(&alice_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (bob, _bob_events) = Transport::bind(&bob_identity, TransportConfig { relay: Some((relay_map, relay_url)) }).await.unwrap();
+
+        alice.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+        bob.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+
+        let content = b"a rather large attachment, in spirit if not in this test's actual byte count".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let hash: [u8; 32] = hasher.finalize().into();
+        alice.serve_attachment(hash, content.clone()).await;
+
+        bob.dial(alice.endpoint_addr()).await.unwrap();
+        // Give the connection's control-stream handshake a moment to land
+        // before requesting -- request_attachment requires an already-tracked
+        // connection (see this task's Interfaces note) and does not implicitly
+        // dial or wait.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let fetched = bob
+            .request_attachment("space-1", hash, alice.endpoint_id())
+            .await
+            .expect("bob should fetch the attachment directly from alice");
+        assert_eq!(fetched, content);
+
+        // Requesting a hash alice never served must fail, not hang or panic.
+        let missing_hash = [0xffu8; 32];
+        let result = bob.request_attachment("space-1", missing_hash, alice.endpoint_id()).await;
+        assert!(result.is_err(), "requesting an unserved hash should return an error, not succeed");
+    }
+
+    /// Self-review-driven addition (not in the task brief's own test list):
+    /// the brief's own test content (~78 bytes) never exceeds
+    /// `ATTACHMENT_CHUNK_SIZE` (64 KiB), so it can't distinguish "actually
+    /// streamed in chunks" from "sent as one giant frame" -- a bug class the
+    /// self-review checklist explicitly calls out. This test uses content
+    /// several times larger than the chunk size, forcing
+    /// `serve_attachment_request` to write multiple chunk frames and
+    /// `request_attachment` to reassemble them via its `loop`, and confirms
+    /// the reassembled bytes are byte-for-byte identical and hash-verified.
+    #[tokio::test]
+    async fn attachment_larger_than_one_chunk_reassembles_correctly() {
+        use sha2::{Digest, Sha256};
+
+        let (relay_map, relay_url, _relay_server) = iroh::test_utils::run_relay_server().await.unwrap();
+        let alice_identity = TransportIdentity::generate();
+        let bob_identity = TransportIdentity::generate();
+        let (alice, _alice_events) = Transport::bind(&alice_identity, TransportConfig { relay: Some((relay_map.clone(), relay_url.clone())) }).await.unwrap();
+        let (bob, _bob_events) = Transport::bind(&bob_identity, TransportConfig { relay: Some((relay_map, relay_url)) }).await.unwrap();
+
+        alice.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+        bob.add_space("space-1", 0, Arc::new(Mutex::new(Segment::new("space-1", 0)))).await;
+
+        // 3.5x the 64 KiB chunk size, with a non-repeating-looking pattern
+        // (byte value cycling through 0..=255) so a bug that dropped,
+        // duplicated, or misordered a chunk would corrupt the content in a
+        // way `assert_eq!` -- and the hash check inside `request_attachment`
+        // itself -- would actually catch, rather than accidentally matching.
+        let content: Vec<u8> = (0..(ATTACHMENT_CHUNK_SIZE * 7 / 2)).map(|i| (i % 256) as u8).collect();
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let hash: [u8; 32] = hasher.finalize().into();
+        alice.serve_attachment(hash, content.clone()).await;
+
+        bob.dial(alice.endpoint_addr()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let fetched = bob
+            .request_attachment("space-1", hash, alice.endpoint_id())
+            .await
+            .expect("bob should fetch the multi-chunk attachment directly from alice");
+        assert_eq!(fetched.len(), content.len());
+        assert_eq!(fetched, content);
     }
 }
