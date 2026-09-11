@@ -16,7 +16,11 @@ pub struct StreamHandle {
 /// two peers, not eagerly for every shared space regardless of activity.
 /// This type owns no notion of *which* spaces are active; that policy
 /// decision belongs to `Transport` (Task 7), which calls `open` only for
-/// spaces `exchange_digests` (Task 5) found to have diverging heads.
+/// spaces present in both its local registry and the remote peer's
+/// `exchange_digests` (Task 5) result, at a *matching epoch* -- not based
+/// on comparing `heads` (skipping the open when `heads` already match
+/// would be a further efficiency optimization, not implemented by this
+/// crate).
 ///
 /// Each call to `open` produces a brand-new QUIC stream — this type does
 /// not cache or reuse streams by `(space_id, category)`. The brief's
