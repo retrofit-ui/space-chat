@@ -9,10 +9,13 @@ use tokio::sync::{mpsc, watch};
 pub enum ConnectionStatus {
     /// At least one peer connection is currently live.
     Connected,
-    /// No peer connections are currently live, but this device has at least
-    /// attempted one (distinguishes "never tried" from "tried and lost it,"
-    /// for a later task's UI affordance -- e.g. "reconnecting..." vs. no
-    /// message at all on first launch before any dial has happened).
+    /// No peer connections are currently live. This is also the initial
+    /// value at bind time, before any dial has ever been attempted -- this
+    /// type does NOT distinguish "never tried" from "tried and lost it." A
+    /// later task's UI affordance that wants that distinction (e.g.
+    /// "reconnecting..." only after a connection was lost, vs. no message at
+    /// all before any dial) needs a separate signal (e.g. whether `dial` has
+    /// ever been called), not this enum.
     Disconnected,
 }
 
@@ -38,7 +41,10 @@ impl AppNetwork {
     /// takes ownership of to drive its own persistence/spec-regeneration
     /// pipeline; `AppNetwork` itself only peeks at `Connected`/`Disconnected`
     /// via a `watch` channel fed by a small forwarding task, not by
-    /// consuming the real receiver itself.
+    /// consuming the real receiver itself. The forwarding task exits (and
+    /// `subscribe_status()` freezes at its last value) once the caller drops
+    /// the returned receiver -- callers are expected to hold it for the
+    /// process's lifetime.
     pub async fn bind(
         identity: &TransportIdentity,
         config: TransportConfig,
