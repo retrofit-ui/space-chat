@@ -1,4 +1,5 @@
 pub mod membership;
+pub mod observed_at;
 pub mod spec;
 
 #[tauri::command]
