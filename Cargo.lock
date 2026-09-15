@@ -5700,6 +5700,7 @@ dependencies = [
 name = "space-chat-app"
 version = "0.1.0"
 dependencies = [
+ "automerge",
  "serde",
  "serde_json",
  "space-chat-core",
