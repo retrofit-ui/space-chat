@@ -16,6 +16,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 space-chat-core = { path = "../../space-chat-core" }
 space-chat-transport = { path = "../../space-chat-transport" }
+space-chat-storage-files = { path = "../../space-chat-storage-files" }
+space-chat-storage-redb = { path = "../../space-chat-storage-redb" }
+space-chat-search-tantivy = { path = "../../space-chat-search-tantivy" }
+redb = "2"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
