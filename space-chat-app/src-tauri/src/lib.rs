@@ -1,4 +1,5 @@
 pub mod conversation_spec;
+pub mod live_spec;
 pub mod membership;
 pub mod observed_at;
 pub mod spec;
