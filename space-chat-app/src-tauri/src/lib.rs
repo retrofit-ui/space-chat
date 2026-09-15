@@ -1,3 +1,5 @@
+pub mod spec;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {name}! space-chat is running.")
