@@ -1,3 +1,4 @@
+pub mod membership;
 pub mod spec;
 
 #[tauri::command]
