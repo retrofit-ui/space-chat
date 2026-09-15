@@ -4719,3 +4719,334 @@ Per this workspace's established process (see Milestone 1's and Milestone 2's pl
 **Placeholder scan:** no step in this plan says "add error handling," "write tests for the above," or "similar to Task N" without showing the actual code — every task's code blocks are complete, compilable-as-written Rust/TypeScript. The two places this plan uses the word "placeholder" (`SpaceMembership`, invite tokens) are deliberate, documented scope decisions with working code behind them, not unfilled steps.
 
 **Type consistency:** `ViewSpec`'s variant names/JSON tags (Task 2) are used identically in `conversation_spec.rs` (Task 5), `commands.rs` (Tasks 9–11), and mirrored field-for-field in `spec.ts` (Task 14). `PatchResponse`'s three-variant shape (Task 6) is produced identically by `commands.rs` (Tasks 9–10) and consumed identically by `liveSpecClient.ts` (Task 15) and `events.rs`'s `ConversationPatchEvent` (Task 9). `AppState`'s field names (Task 8) are used consistently by every later task that touches it (Tasks 9–13, 21) — corrected during self-review: `regenerate_spec_value`'s `has_more_older` was initially hardcoded `false`, factored out into a shared `compute_has_more_older` helper (Task 9) that Task 11's `fetch_older_page_impl` now also calls, so the two code paths can't silently disagree.
+---
+
+## Amendment: real Milestone 3 `Transport` integration (supersedes Task 7's `NetworkService`/TCP-loopback design)
+
+**Decision (made explicitly, with the user, before executing this plan):** wire `space-chat-app` to the REAL `space-chat-transport` crate (Milestone 3, merged to `main`) instead of building the generic `NetworkService` trait + `TcpLoopbackNetworkService` stand-in Task 7 originally specified. Task 7's own text already anticipated this exact reconciliation point ("Before wiring `space-chat-app` to real `iroh` networking, reconcile this trait against Milestone 3's actual public API... do not assume this trait survives unchanged") — this amendment is that reconciliation.
+
+**Why this isn't a simple swap-the-implementation change.** `NetworkService` was designed around a generic push/pull message-passing shape (`send(change)` / `take_incoming() -> Receiver<SegmentChange>`) because Milestone 3's real API didn't exist yet when this plan was drafted. The real `Transport` (from `space-chat-transport`) has a fundamentally different, and simpler, shape: the caller registers a space ONCE via `Transport::add_space(space_id, epoch, segment: Arc<Mutex<Segment>>)`, handing `Transport` a **shared, mutex-guarded handle to the actual live `Segment`** — from then on, `Transport` autonomously syncs that segment against whichever peers are dialed/connected for that space, mutating it in place via `receive_sync_message` inside its own background sync loop. There is no generic "send this change" call for outgoing content — the caller just mutates the shared `Segment` directly (e.g. `append_message`) and calls `Transport::notify_local_change(space_id)` to wake any parked sync tasks immediately instead of waiting for the next poll tick.
+
+This means `AppState` must hold **one persistent, long-lived `Arc<Mutex<Segment>>` per active space** that is the single source of truth both local command handlers (Tasks 9-11) and `Transport`'s own sync loop mutate — not the original design's "reload fresh from disk, mutate a local copy, save" pattern for the mutation path (that pattern is still fine, unchanged, for the READ-only `segments_for` used by spec-generation, since disk is kept current after every mutation either way).
+
+### Revised Task 7: `AppNetwork` — a thin wrapper around real `Transport`
+
+**Files:** same as originally specified (`space-chat-app/src-tauri/src/network.rs`), but the module's actual contents are replaced entirely.
+
+**Produces (replacing the original `NetworkService`/`TcpLoopbackNetworkService`/`run_loopback_relay`):**
+
+```rust
+// space-chat-app/src-tauri/src/network.rs
+use space_chat_transport::{Transport, TransportConfig, TransportEvent, TransportIdentity};
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    /// At least one peer connection is currently live.
+    Connected,
+    /// No peer connections are currently live, but this device has at least
+    /// attempted one (distinguishes "never tried" from "tried and lost it,"
+    /// for Task 21's UI affordance -- e.g. "reconnecting..." vs. no message
+    /// at all on first launch before any dial has happened).
+    Disconnected,
+}
+
+/// Thin app-specific wrapper around a real `space_chat_transport::Transport`.
+/// Owns the `Transport` value and its raw `TransportEvent` receiver;
+/// `AppState` (Task 8) is the one place that actually consumes events --
+/// this type's job is just binding and exposing a `ConnectionStatus` watch
+/// channel derived from `Connected`/`Disconnected` events, which is cheap
+/// and independent of whatever `AppState` does with the rest of the event
+/// stream.
+pub struct AppNetwork {
+    pub transport: Arc<Transport>,
+    status_rx: watch::Receiver<ConnectionStatus>,
+}
+
+impl AppNetwork {
+    /// Binds a real `iroh` endpoint. `config` is `TransportConfig::default()`
+    /// (real `n0` relay/discovery) in production; tests pass
+    /// `TransportConfig { relay: Some((relay_map, relay_url)) }` against a
+    /// local `iroh::test_utils::run_relay_server()`, exactly as every
+    /// Milestone 3 test already does -- do not reintroduce a TCP stand-in.
+    /// Returns the wrapper plus the raw event receiver, which the caller
+    /// (`AppState::new`, Task 8) takes ownership of to drive its own
+    /// persistence/spec-regeneration pipeline; `AppNetwork` itself only
+    /// peeks at `Connected`/`Disconnected` via a `watch` channel fed by a
+    /// small forwarding task, not by consuming the real receiver itself.
+    pub async fn bind(
+        identity: &TransportIdentity,
+        config: TransportConfig,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<TransportEvent>), space_chat_transport::TransportError> {
+        let (transport, mut events_rx) = Transport::bind(identity, config).await?;
+        let transport = Arc::new(transport);
+
+        // Forward Connected/Disconnected into a watch channel for cheap,
+        // last-value-only status polling (Task 21), while still handing the
+        // FULL event stream on to the caller for everything else
+        // (IncomingChange, JoinRequest) -- this requires a second channel
+        // the caller reads from, since `mpsc::Receiver` has only one
+        // consumer. Re-plumb: this function creates its own forwarding
+        // task that reads `events_rx` and re-sends every event onward on a
+        // fresh channel the caller gets back, updating `status_tx` as a
+        // side effect for `Connected`/`Disconnected` specifically.
+        let (status_tx, status_rx) = watch::channel(ConnectionStatus::Disconnected);
+        let (forward_tx, forward_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        tokio::spawn(async move {
+            let mut live_connections: u32 = 0;
+            while let Some(event) = events_rx.recv().await {
+                match &event {
+                    TransportEvent::Connected { .. } => {
+                        live_connections += 1;
+                        let _ = status_tx.send(ConnectionStatus::Connected);
+                    }
+                    TransportEvent::Disconnected { .. } => {
+                        live_connections = live_connections.saturating_sub(1);
+                        if live_connections == 0 {
+                            let _ = status_tx.send(ConnectionStatus::Disconnected);
+                        }
+                    }
+                    _ => {}
+                }
+                if forward_tx.send(event).is_err() {
+                    break; // caller dropped its receiver -- nothing left to forward to
+                }
+            }
+        });
+
+        Ok((Self { transport, status_rx }, forward_rx))
+    }
+
+    pub fn subscribe_status(&self) -> watch::Receiver<ConnectionStatus> {
+        self.status_rx.clone()
+    }
+}
+```
+
+**Dependency change:** add `space-chat-transport = { path = "../../space-chat-transport" }` to `space-chat-app/src-tauri/Cargo.toml`'s `[dependencies]` (not dev-dependencies — this is used in production `run()`, not only in tests).
+
+**Tests for this task:** a minimal test binding two `AppNetwork`s over a local `iroh::test_utils::run_relay_server()` (mirroring Milestone 3's own `bootstrap.rs`/`transport.rs` test patterns exactly — reuse `TransportIdentity::generate()`, `TransportConfig { relay: Some((relay_map, relay_url)) }`), confirming `subscribe_status()` observes `Connected` after a `dial`. Do not write a TCP-relay test — there is no TCP relay in this design anymore.
+
+**No `NullNetworkService` needed:** `AppState`'s tests (Task 8) that don't want to exercise real networking can bind a real `AppNetwork` against `TransportConfig { relay: None }` with no `dial()` ever called — this is a real, unconnected `Transport` instance, cheap to bind (no network I/O happens until something dials out), and behaves correctly as an inert default without a separate null-object type to maintain.
+
+---
+
+### Revised Task 8: `AppState` — `Transport`-backed segment registry + background event pipeline
+
+**Changed `AppState` fields** (replacing `network: Box<dyn NetworkService>` and `change_tx: broadcast::Sender<SegmentChange>`):
+
+```rust
+pub struct AppState {
+    pub local_device: DeviceId,
+    pub segment_store: Mutex<FileSegmentStore>,
+    pub attachment_store: Mutex<FileAttachmentStore>,
+    pub listing_index: Mutex<RedbListingIndex>,
+    pub attachment_metadata: Mutex<RedbAttachmentMetadataStore>,
+    pub observed_at: Mutex<RedbObservedAtStore>,
+    pub membership: Mutex<PlaintextMembership>,
+    pub network: crate::network::AppNetwork,
+    /// The ONE live, shared `Segment` handle per currently-known space, at
+    /// its current epoch (epoch rollover stays out of scope for this plan,
+    /// per Task 10's existing `CURRENT_EPOCH` constant). This is the exact
+    /// `Arc<Mutex<Segment>>` registered with `Transport` via `add_space` --
+    /// both local mutation (Tasks 9-11) and `Transport`'s own sync loop
+    /// mutate THIS handle, never a separately-loaded copy, so the two can
+    /// never diverge. Lazily populated by `segment_arc` on first access.
+    pub active_segments: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Segment>>>>,
+    pub active: Mutex<HashMap<String, ActiveConversation>>,
+}
+```
+
+(`Mutex` for `active_segments`'s inner `Segment` must be `tokio::sync::Mutex`, not `std::sync::Mutex` — `Transport::add_space`'s signature requires `Arc<tokio::sync::Mutex<Segment>>` exactly; every other `AppState` field can stay `std::sync::Mutex` as originally planned, since only this one is ever held across an `.await` from the `Transport` side.)
+
+**New method, replacing the implicit "just call `segments_for` and mutate a fresh copy" pattern for the MUTATION path specifically** (`segments_for` itself, used for read-only spec generation, is UNCHANGED — see rationale above):
+
+```rust
+impl AppState {
+    /// Returns the persistent, shared `Segment` handle for `space_id`'s
+    /// current epoch, registering it with `Transport` via `add_space` the
+    /// FIRST time it's requested for this process's lifetime (idempotent
+    /// after that -- `Transport::add_space` is safe to call again, but
+    /// this method only does so once per `space_id` by checking the cache
+    /// first, since re-registering is currently a documented, deliberately
+    /// unimplemented gap in Milestone 3 -- see its plan's amendment notes
+    /// on late `add_space` calls never syncing over pre-existing
+    /// connections; calling `add_space` exactly once per space, as early as
+    /// possible, sidesteps that gap entirely rather than depending on it).
+    pub async fn segment_arc(&self, space_id: &str) -> Arc<tokio::sync::Mutex<Segment>> {
+        const CURRENT_EPOCH: u64 = 0;
+        let mut active = self.active_segments.lock().await;
+        if let Some(existing) = active.get(space_id) {
+            return existing.clone();
+        }
+        // First access: load from disk if present, else start fresh --
+        // mirrors `segments_for`'s own per-epoch load logic for consistency.
+        let loaded = {
+            let store = self.segment_store.lock().unwrap();
+            store
+                .load_segment(space_id, CURRENT_EPOCH)
+                .ok()
+                .flatten()
+                .and_then(|bytes| Segment::load(&bytes, space_id, CURRENT_EPOCH, 0).ok())
+        };
+        let segment = loaded.unwrap_or_else(|| Segment::new(space_id, CURRENT_EPOCH));
+        let arc = Arc::new(tokio::sync::Mutex::new(segment));
+        self.network.transport.add_space(space_id, CURRENT_EPOCH, arc.clone()).await;
+        active.insert(space_id.to_string(), arc.clone());
+        arc
+    }
+}
+```
+
+**`AppState::new`'s signature changes** to take a bound `crate::network::AppNetwork` plus its event receiver, instead of `network: Box<dyn NetworkService>`:
+
+```rust
+pub fn new(
+    data_dir: impl Into<PathBuf>,
+    local_device: DeviceId,
+    network: crate::network::AppNetwork,
+    network_events: mpsc::UnboundedReceiver<TransportEvent>,
+    app_handle: tauri::AppHandle, // needed to emit patch events from the background task below
+) -> Result<Arc<Self>, AppStateError> {
+    // ... unchanged setup for segment_store/attachment_store/listing_index/
+    // attachment_metadata/observed_at/membership ...
+
+    let state = Arc::new(Self {
+        local_device,
+        segment_store: Mutex::new(segment_store),
+        attachment_store: Mutex::new(attachment_store),
+        listing_index: Mutex::new(listing_index),
+        attachment_metadata: Mutex::new(attachment_metadata),
+        observed_at: Mutex::new(observed_at),
+        membership: Mutex::new(membership),
+        network,
+        active_segments: tokio::sync::Mutex::new(HashMap::new()),
+        active: Mutex::new(HashMap::new()),
+    });
+
+    spawn_network_event_loop(state.clone(), network_events, app_handle);
+
+    Ok(state)
+}
+```
+
+Note `AppState::new` now returns `Arc<Self>` (not a bare `Self`) — the background event loop needs its own owned handle to the state alongside whatever `tauri::Builder::manage` holds, and `tauri::State` already derefs through an inner `Arc` in Tauri 2's actual implementation, so `.manage(state)` with an `Arc<AppState>` works the same way `.manage` on a bare `AppState` did; verify this specific point against the pinned `tauri` version's docs, per this plan's Global Constraints about verifying exact APIs.
+
+**The background event loop — the "third consumer of the storage spec's `Projection` change feed," now driven by real network events instead of the original design's generic broadcast channel:**
+
+```rust
+fn spawn_network_event_loop(
+    state: Arc<AppState>,
+    mut events: mpsc::UnboundedReceiver<TransportEvent>,
+    app_handle: tauri::AppHandle,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                TransportEvent::IncomingChange(change) => {
+                    // The shared Segment Arc for `change.space_id` has
+                    // ALREADY been mutated in place by Transport's own sync
+                    // loop by the time this event fires (Transport holds the
+                    // exact same Arc `segment_arc` registered). This handler's
+                    // job is purely the downstream bookkeeping: persist,
+                    // index, and (if actively viewed) regenerate + push a
+                    // patch -- the same three steps Task 10's local mutation
+                    // path does, just triggered by a network merge instead
+                    // of a direct command call.
+                    apply_incoming_change(&state, &app_handle, &change).await;
+                }
+                TransportEvent::Connected { .. } | TransportEvent::Disconnected { .. } => {
+                    // Handled by AppNetwork's own status watch channel
+                    // (Task 21 subscribes to that directly); nothing to do
+                    // here.
+                }
+                TransportEvent::JoinRequest(_request) => {
+                    // Out of scope for this plan -- Task 12's invite/
+                    // membership flow is a local-only placeholder that does
+                    // not use Transport's real sequencer-routed join at all
+                    // (see the "Task 12: unchanged" note below). A real
+                    // `space-chat-openmls` integration is what would act on
+                    // this event; until then it's intentionally ignored.
+                }
+            }
+        }
+    });
+}
+
+/// Shared by both the network event loop (above) and Task 10's local
+/// mutation commands: given a space whose shared `Segment` has just
+/// changed (by any means), persist it, append any newly-discovered message
+/// keys to `ListingIndex`, and -- if actively viewed -- regenerate its spec
+/// and emit a patch event. Task 10's `mutate_and_persist` should be
+/// refactored to call this same helper after its own mutation closure runs,
+/// rather than duplicating the persist/index/regenerate logic.
+async fn apply_incoming_change(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+    change: &space_chat_core::projection::SegmentChange,
+) {
+    // Persist the (already-mutated-in-place) segment's current bytes.
+    let bytes = {
+        let arc = state.segment_arc(&change.space_id).await;
+        let mut seg = arc.lock().await;
+        seg.save()
+    };
+    if let Ok(mut store) = state.segment_store.lock() {
+        let _ = store.save_segment(&change.space_id, change.epoch, &bytes);
+    }
+
+    // Diff against ListingIndex to find message keys not yet indexed, in
+    // the same `message_keys()`-iteration style Task 5/10 already use, and
+    // append any new ones -- see Task 10's existing new-listing-entries
+    // logic for the exact pattern to reuse here (this amendment does not
+    // redefine that diff logic, only where it's called from).
+    // ... (implementer: factor Task 10's existing "compute new listing
+    // entries" logic into a function both this path and `mutate_and_persist`
+    // call, rather than inlining it twice) ...
+
+    let active = state.active.lock().unwrap();
+    if let Some(conversation) = active.get(&change.space_id) {
+        let new_value = regenerate_spec_value(state, &change.space_id, &change.space_id);
+        conversation.live_spec.update(new_value);
+        let (version, _) = conversation.live_spec.snapshot();
+        let patch = conversation.live_spec.diff_since(version.saturating_sub(1));
+        use tauri::Emitter;
+        let event = crate::events::ConversationPatchEvent { space_id: change.space_id.clone(), patch };
+        let _ = app_handle.emit(&crate::events::conversation_patch_event_name(&change.space_id), event);
+    }
+}
+```
+
+**`run()`'s binding sequence** (in `lib.rs`) changes to bind `AppNetwork` (async) before constructing `AppState`, which means `run()`'s top-level setup needs an async context it didn't need before — do this inside Tauri's `.setup()` closure (which can spawn a blocking/async task) rather than trying to `.await` directly in `fn run()` (which is synchronous). Read Tauri 2's actual `.setup()` closure signature and async-setup patterns from its current docs before implementing this step; this plan cannot pin the exact incantation since it depends on the specific Tauri version already pinned by Task 1.
+
+**Global Constraint addition:** production `run()` binds with `TransportConfig::default()`-equivalent (real relay/discovery — i.e. `TransportConfig { relay: None }`, which Milestone 3's `bootstrap.rs` routes to the real `N0` preset); only tests use `TransportConfig { relay: Some(..) }` against a local test relay.
+
+---
+
+### Task 9, 10, 11: call-site changes only (no interface/signature changes beyond what's below)
+
+- Anywhere the original plan said `state.network.send(change)`: replace with `state.network.transport.notify_local_change(space_id).await` — there is no explicit "send this change" call anymore; mutating the shared segment IS the send, and `notify_local_change` just wakes any parked sync tasks immediately instead of waiting for their next poll tick.
+- Task 10's `mutate_and_persist`: replace `let mut segments = state.segments_for(space_id); let mut segment = segments.remove(&CURRENT_EPOCH).unwrap_or_else(...)` with `let arc = state.segment_arc(space_id).await; let mut segment = arc.lock().await;` — mutate THIS guard, not a freshly-loaded copy, then still persist its bytes to `segment_store` exactly as before (Transport does not persist anything itself). After releasing the lock, call `state.network.transport.notify_local_change(space_id).await` instead of `state.network.send(change)`.
+- Task 9's `open_conversation_impl`: should call `state.segment_arc(space_id).await` once (to ensure the space is registered with `Transport` as soon as it's actively viewed, even if it was never touched by a mutation yet — e.g. a space the local device joined but hasn't posted in) in addition to whatever it already does with `segments_for` for spec generation.
+- Task 11's `fetch_older_page_impl`: unchanged — it only reads via `ListingIndex`/`segments_for`, never mutates.
+
+### Task 12: **no change**
+
+Task 12's invite/membership flow is, by its own explicit and correct design, a local-only placeholder: `join_via_invite_impl` only adds a row to the local `PlaintextMembership` store and is never exercised across a real connection by this plan's own test design (scenario actors get membership seeded directly by test setup, per Task 12's module-level caveat, which this amendment does not change). Wiring `generate_invite`/`join_via_invite` to `Transport`'s REAL sequencer-routed invite mechanism (Milestone 3 Task 10) would additionally require a real "new member starts receiving segment data after being accepted" flow that Milestone 3 itself doesn't fully specify end-to-end (it proves routing works, not full post-join sync bootstrapping) — implementing that now would be a substantial, risky expansion outside what was actually decided (real transport for message sync, not real transport for membership/invites). Leave Task 12 exactly as originally planned.
+
+### Tasks 17-20: multi-actor test harness — real endpoint dial, not a TCP relay
+
+Replace `run_loopback_relay`/`TcpLoopbackNetworkService` throughout with:
+
+1. **A real local `iroh` test relay**, started once per scenario exactly the way Milestone 3's own tests do: `iroh::test_utils::run_relay_server().await` (available since `space-chat-transport` is now a real dependency of `space-chat-app`, this is reachable via `iroh::test_utils::run_relay_server` directly — `iroh`'s `test-utils` feature must be enabled for `space-chat-app`'s dev-dependencies the same way Milestone 3 did it, via the crate-dev-depending-on-itself pattern `space-chat-transport`'s own `Cargo.toml` established — reuse that exact pattern, don't reinvent it).
+2. **Each spawned actor process needs to (a) learn the relay's `(RelayMap, RelayUrl)`, (b) print its own bound `EndpointId`/dial-address somewhere the harness can read it, and (c) be told which specific other actors to dial, matching the Gherkin scenario's stated topology (not an auto-connect-everyone-to-everyone mesh — several scenarios specifically test "Alice and Carol have no direct path").** Concretely, extend `run()`'s startup (behind env vars, mirroring the existing `SPACECHAT_DATA_DIR` pattern):
+   - `SPACECHAT_RELAY_URL` / a serialized `RelayMap` (however `iroh::test_utils::run_relay_server()`'s returned pieces are most simply serialized to pass through an env var — e.g. the relay URL as a string, reconstructing a single-entry `RelayMap` from it, the same construction Milestone 3's own tests already do) — tells this actor's `Transport::bind` to use `TransportConfig { relay: Some(..) } ` against the SAME local test relay every other actor in the scenario uses.
+   - `SPACECHAT_ENDPOINT_ADDR_FILE` (a path) — on successful bind, the app writes its own `iroh::EndpointAddr` (encoded however is simplest — e.g. via `Invite`-style hex/CBOR encoding already established in `space-chat-transport`, or just `Debug`-formatted if that's simplest for a test-only file the harness itself parses) to this file, so the harness can read it once the actor is up.
+   - `SPACECHAT_DIAL_ADDRS` (comma-separated, each a path to another actor's `SPACECHAT_ENDPOINT_ADDR_FILE`, OR the harness reads the target files itself and passes the encoded addresses directly) — on startup, after binding, the app reads each and calls `state.network.transport.dial(...)` for each one. This gives the harness precise, per-scenario control over the connection topology by choosing what to pass for each spawned actor, matching exactly what Milestone 3's own `test_peer.rs` binary does for its own two/three-process tests (reuse that pattern, don't invent a new one).
+   These four env vars are read once at startup in `run()`, gated so they're a no-op if unset (a normal end-user launch has none of them set and just binds with real production discovery per the Global Constraint above).
+3. `SpaceChatWorld::ensure_relay` (Task 17) becomes `ensure_relay` returning the real `(RelayMap, RelayUrl, relay_server_handle)` triple from `iroh::test_utils::run_relay_server()`, stored on the `World` for the scenario's lifetime.
+4. `spawn_actor` (Task 17) gains a topology parameter (e.g. `dial_targets: &[&str]`, actor names already spawned that this new actor should connect to) and, before spawning, resolves those names to their `SPACECHAT_ENDPOINT_ADDR_FILE` paths (already known once those actors were themselves spawned) to pass via `SPACECHAT_DIAL_ADDRS`.
+5. Given/When/Then step definitions (Tasks 18-20) that describe topology (e.g. "Given Alice and Bob are online, Carol is offline" / "Alice and Carol have no direct path") now translate directly into which `dial_targets` each `spawn_actor` call is given — this is a natural, direct translation once the mechanism above exists; no further redesign needed at the step-definition level.
+
+**This is real integration work, not a mechanical brief-following exercise** — the implementer for Tasks 17+ should verify each piece (the exact `iroh::test_utils::run_relay_server()` return shape, exactly how to encode/decode an `EndpointAddr` for the file-based handoff, exact env-var-reading placement in `run()`) against `space-chat-transport`'s actual current source and Milestone 3's own test code (`space-chat-transport/src/bin/test_peer.rs` and `tests/two_process_convergence.rs` are the closest existing precedent and should be read directly before implementing this) rather than treating this amendment's prose as gospel over what's actually achievable.
