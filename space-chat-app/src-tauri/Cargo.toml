@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 space-chat-core = { path = "../../space-chat-core" }
+space-chat-transport = { path = "../../space-chat-transport" }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
@@ -27,3 +28,16 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
 tauri = { version = "2", features = ["test"] }
 automerge = "0.5"
+# Turns on `space-chat-transport`'s `test-utils` feature (which forwards to
+# `iroh/test-utils`) for any test target in this crate, via feature
+# unification, without ever enabling it for a plain `cargo build` of the
+# production binary -- mirrors the same trick `space-chat-transport` uses
+# on itself in its own Cargo.toml.
+space-chat-transport = { path = "../../space-chat-transport", features = ["test-utils"] }
+# `iroh` is only a transitive dependency via `space-chat-transport` in
+# [dependencies], which is not enough for this crate's own test code to
+# reference `iroh::test_utils::run_relay_server()` directly -- Rust requires
+# a direct Cargo.toml edge for that. Feature unification (see above) still
+# ensures this same `iroh` gets its `test-utils` feature turned on whenever
+# a test target builds, so no feature list is needed here.
+iroh = "1"

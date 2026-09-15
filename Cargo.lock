@@ -5723,10 +5723,12 @@ name = "space-chat-app"
 version = "0.1.0"
 dependencies = [
  "automerge",
+ "iroh",
  "json-patch 4.2.0",
  "serde",
  "serde_json",
  "space-chat-core",
+ "space-chat-transport",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
