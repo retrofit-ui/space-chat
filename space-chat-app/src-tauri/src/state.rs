@@ -5,7 +5,7 @@ use crate::observed_at::ObservedAtStore;
 use redb::{Database, ReadableTable, TableDefinition};
 use space_chat_core::domain::DeviceId;
 use space_chat_core::segment::Segment;
-use space_chat_core::storage::{AttachmentBlobStore, SegmentBlobStore, StorageError};
+use space_chat_core::storage::{AttachmentBlobStore, ListingIndex, SegmentBlobStore, StorageError};
 use space_chat_storage_files::{FileAttachmentStore, FileSegmentStore};
 use space_chat_storage_redb::attachment_metadata::RedbAttachmentMetadataStore;
 use space_chat_storage_redb::listing::RedbListingIndex;
@@ -208,37 +208,80 @@ impl AppState {
     }
 }
 
+/// Diffs `message_keys` (every message key currently in the segment) against
+/// what `listing` already has indexed for `space_id`, and appends a
+/// `ListingEntry` for each one not yet present, continuing the `seq` counter
+/// from whatever the highest existing entry already used.
+///
+/// **Known, deliberately-accepted limitation:** `Segment::message_keys`'s own
+/// doc comment states it iterates "in no particular order" -- Automerge maps
+/// don't preserve insertion/causal order the way an Automerge list/text
+/// object would. A local mutation (a later task's `mutate_and_persist`) never
+/// needs this function at all, since it always knows exactly which key(s) it
+/// just created and in what order. But for messages that arrive via network
+/// sync, there is currently no way to recover the true chronological order
+/// of multiple messages introduced within the same sync batch without
+/// extending `Segment`'s public API (e.g. exposing which keys a specific
+/// Automerge change introduced) -- a Milestone 1 change, out of scope here.
+/// This function's ordering trade-off is deliberate: newly-synced messages
+/// become visible/paginable at all (the correctness gap this function exists
+/// to close -- without it, received messages would silently never appear in
+/// any conversation view), at the cost of their relative order among each
+/// other, within one batch, not being guaranteed chronological. Tracked here
+/// explicitly rather than silently assumed correct.
+fn append_new_listing_entries(listing: &mut RedbListingIndex, space_id: &str, epoch: u64, message_keys: &[String]) {
+    use space_chat_core::storage::ListingEntry;
+
+    let mut existing_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut max_seq: Option<u64> = None;
+    let mut before: Option<(u64, u64)> = None;
+    const BATCH: usize = 200;
+    loop {
+        let Ok(page) = listing.page(space_id, before, BATCH) else { break };
+        if page.is_empty() {
+            break;
+        }
+        for entry in &page {
+            existing_keys.insert(entry.message_key.clone());
+            max_seq = Some(max_seq.map_or(entry.seq, |m: u64| m.max(entry.seq)));
+        }
+        let done = page.len() < BATCH;
+        before = page.last().map(|last| (last.epoch, last.seq));
+        if done {
+            break;
+        }
+    }
+
+    let mut next_seq = max_seq.map_or(0, |m| m + 1);
+    for key in message_keys {
+        if existing_keys.contains(key) {
+            continue;
+        }
+        let _ = listing.append_entry(ListingEntry {
+            space_id: space_id.to_string(),
+            epoch,
+            seq: next_seq,
+            message_key: key.clone(),
+        });
+        next_seq += 1;
+    }
+}
+
 /// The background network-event pipeline: the "third consumer of the
 /// storage spec's `Projection` change feed," driven by real network events.
 ///
 /// IMPORTANT -- SCOPED DELIBERATELY NARROW FOR THIS TASK: this handles
 /// `IncomingChange` by persisting the already-mutated-in-place shared
-/// segment and bringing `listing_index` up to date via `replay::catch_up`.
-/// It does NOT regenerate an actively-viewed conversation's spec or push a
-/// patch event yet -- that needs `regenerate_spec_value`/`crate::events`,
-/// which are introduced in the NEXT task. Whoever implements that task must
-/// extend this same function (not build a second, competing event loop) to
-/// add: "if `state.active` has an entry for `change.space_id`, regenerate
-/// its spec value, call `live_spec.update(..)`, and emit a
-/// `ConversationPatchEvent`." See this task's brief for the full reasoning.
-///
-/// DISCOVERED GAP (verified directly against `space-chat-storage-redb/src/listing.rs`,
-/// not assumed): `RedbListingIndex`'s `Projection::apply` -- the method
-/// `replay::catch_up` drives -- only advances the per-`(space_id, epoch)`
-/// watermark; per its own doc comment, it deliberately does NOT decode
-/// `SegmentChange.bytes` into `ListingEntry` rows, leaving that to "the
-/// composition root that owns both a `Segment` and this index together."
-/// That means the `catch_up` call below correctly makes `listing_index`
-/// idempotent/no-op-safe against a change already seen, but does NOT by
-/// itself add a page-able `ListingEntry` for a message that arrived via
-/// network sync -- only `Segment::save`/`segment_store` (the source of
-/// truth) actually gains the new content. Decoding `Segment` content into
-/// `ListingEntry` rows for remote-delivered messages (with a `seq` counter
-/// and dedup against entries a local mutation may have already appended)
-/// is a real design decision this task's brief did not specify and this
-/// task does not invent unilaterally -- it is left for whichever later task
-/// owns local-mutation `append_entry` calls (see that task's own `next_seq`
-/// bookkeeping) to extend to remote-delivered content too.
+/// segment, advancing `listing_index`'s watermark via `replay::catch_up`,
+/// and populating any not-yet-indexed message keys via
+/// `append_new_listing_entries` (see its doc comment for a real, disclosed
+/// ordering limitation). It does NOT regenerate an actively-viewed
+/// conversation's spec or push a patch event yet -- that needs
+/// `regenerate_spec_value`/`crate::events`, which are introduced in the NEXT
+/// task. Whoever implements that task must extend this same function (not
+/// build a second, competing event loop) to add: "if `state.active` has an
+/// entry for `change.space_id`, regenerate its spec value, call
+/// `live_spec.update(..)`, and emit a `ConversationPatchEvent`."
 fn spawn_network_event_loop<R: tauri::Runtime>(
     state: Arc<AppState>,
     mut events: mpsc::UnboundedReceiver<TransportEvent>,
@@ -248,15 +291,18 @@ fn spawn_network_event_loop<R: tauri::Runtime>(
         while let Some(event) = events.recv().await {
             match event {
                 TransportEvent::IncomingChange(change) => {
-                    let bytes = {
+                    let (bytes, message_keys) = {
                         let arc = state.segment_arc(&change.space_id).await;
                         let mut seg = arc.lock().await;
-                        seg.save()
+                        let bytes = seg.save();
+                        let message_keys: Vec<String> = seg.message_keys().collect();
+                        (bytes, message_keys)
                     };
                     if let Ok(mut store) = state.segment_store.lock() {
                         let _ = store.save_segment(&change.space_id, change.epoch, change.cursor.0, &bytes);
                         if let Ok(mut listing) = state.listing_index.lock() {
                             let _ = space_chat_core::replay::catch_up(&*store, &change.space_id, &mut *listing);
+                            append_new_listing_entries(&mut listing, &change.space_id, change.epoch, &message_keys);
                         }
                     }
                 }
@@ -384,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incoming_change_event_persists_the_segment_and_advances_the_listing_index_watermark() {
+    async fn incoming_change_event_persists_the_segment_and_makes_the_message_page_able() {
         use space_chat_core::projection::{Projection, SegmentCursor};
         use space_chat_core::storage::SegmentBlobStore;
 
@@ -400,14 +446,15 @@ mod tests {
         // test calls the same building blocks directly rather than trying
         // to inject a synthetic event through a real Transport's channel.
         let arc = state.segment_arc("space-1").await;
-        {
+        let message_keys: Vec<String> = {
             let mut seg = arc.lock().await;
             seg.append_message(&Message {
                 sender: DeviceId([1u8; 32]),
                 content: "from the network".to_string(),
                 attachments: vec![],
             });
-        }
+            seg.message_keys().collect()
+        };
         let change = { arc.lock().await.latest_change() };
         state
             .segment_store
@@ -421,32 +468,34 @@ mod tests {
             &mut *state.listing_index.lock().unwrap(),
         )
         .unwrap();
+        append_new_listing_entries(&mut state.listing_index.lock().unwrap(), "space-1", 0, &message_keys);
 
-        // NOTE: this asserts what `catch_up` actually does for
-        // `RedbListingIndex` -- advance its per-(space_id, epoch) watermark
-        // to the persisted change's cursor -- not that a page-able
-        // `ListingEntry` now exists. `RedbListingIndex::apply` deliberately
-        // does not decode `SegmentChange.bytes` into `ListingEntry` rows
-        // (see `space-chat-storage-redb/src/listing.rs`'s own doc comment on
-        // `apply`); that decoding is left to a later task's direct
-        // `append_entry` calls, per `spawn_network_event_loop`'s doc comment
-        // above. A `page()` assertion here would test behavior `catch_up`
-        // was never going to provide.
+        // catch_up advances the watermark (bookkeeping for Projection's own
+        // contract)...
         assert_eq!(
             state.listing_index.lock().unwrap().watermark("space-1", 0),
             SegmentCursor(1),
             "listing_index's watermark should advance to the persisted change's cursor"
         );
+        // ...and append_new_listing_entries is what actually makes the
+        // network-delivered message visible/paginable -- this is the real
+        // gap `catch_up` alone does not close (see this file's doc comments
+        // on `append_new_listing_entries` and `spawn_network_event_loop`).
+        let page = state.listing_index.lock().unwrap().page("space-1", None, 10).unwrap();
+        assert_eq!(page.len(), 1, "the message that arrived via network sync should now be page-able");
+        assert_eq!(page[0].message_key, message_keys[0]);
 
-        // catch_up must be safe to call again with nothing new (documented
-        // idempotency this task's event loop relies on for every future
-        // IncomingChange on a space already fully caught up).
+        // Both catch_up and append_new_listing_entries must be safe to call
+        // again with nothing new (idempotency this task's event loop relies
+        // on for every future IncomingChange on a space already caught up).
         space_chat_core::replay::catch_up(
             &*state.segment_store.lock().unwrap(),
             "space-1",
             &mut *state.listing_index.lock().unwrap(),
         )
         .unwrap();
-        assert_eq!(state.listing_index.lock().unwrap().watermark("space-1", 0), SegmentCursor(1));
+        append_new_listing_entries(&mut state.listing_index.lock().unwrap(), "space-1", 0, &message_keys);
+        let page = state.listing_index.lock().unwrap().page("space-1", None, 10).unwrap();
+        assert_eq!(page.len(), 1, "re-running the event-loop's persistence steps must not duplicate the listing entry");
     }
 }
