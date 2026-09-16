@@ -92,7 +92,7 @@ pub async fn open_conversation_impl(
         .active
         .lock()
         .unwrap()
-        .insert(space_id.to_string(), ActiveConversation { live_spec });
+        .insert(space_id.to_string(), ActiveConversation { live_spec, title: title.to_string() });
 
     OpenConversationResult { version, spec: spec_value }
 }
@@ -266,10 +266,25 @@ mod tests {
         let (_dir, state) = fresh_state().await;
         seed_one_message(&state, "space-1");
 
+        // Real assertion, not a vacuous one: `segment_arc` unconditionally
+        // caches into `active_segments`, so calling it twice always yields
+        // `Arc::ptr_eq` regardless of whether `open_conversation_impl`
+        // registered the space first -- that shape of test would pass even
+        // if the `segment_arc` call were deleted from `open_conversation_impl`
+        // entirely (confirmed by review: deleting that line left the whole
+        // suite green). Instead, check `active_segments` directly, before
+        // and after, to prove `open_conversation_impl` is what causes the
+        // registration.
+        assert!(
+            !state.active_segments.lock().await.contains_key("space-1"),
+            "space should not be registered before open_conversation_impl runs"
+        );
+
         open_conversation_impl(&state, "space-1", "General", 10_000).await;
 
-        let first = state.segment_arc("space-1").await;
-        let second = state.segment_arc("space-1").await;
-        assert!(std::sync::Arc::ptr_eq(&first, &second), "space should already be registered by open_conversation_impl");
+        assert!(
+            state.active_segments.lock().await.contains_key("space-1"),
+            "open_conversation_impl must register the space with Transport via segment_arc"
+        );
     }
 }

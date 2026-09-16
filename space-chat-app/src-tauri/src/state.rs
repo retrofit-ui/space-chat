@@ -82,6 +82,13 @@ impl ObservedAtStore for RedbObservedAtStore {
 /// Global Constraints, every other conversation gets no `LiveSpec` at all.
 pub struct ActiveConversation {
     pub live_spec: LiveSpec,
+    /// The title `open_conversation` was called with. Not persisted anywhere
+    /// yet in this plan's scope, but IS available in-process for as long as
+    /// this conversation stays active -- stored here so the network event
+    /// loop's spec regeneration (which has no title input of its own) uses
+    /// the real title instead of a `space_id` fallback that would visibly
+    /// clobber the frontend's title the moment any network change arrives.
+    pub title: String,
 }
 
 pub struct AppState {
@@ -355,12 +362,16 @@ fn spawn_network_event_loop<R: tauri::Runtime>(
                     // `std::sync::Mutex` on this thread.
                     let active = state.active.lock().unwrap();
                     if let Some(conversation) = active.get(&change.space_id) {
-                        // Title is not persisted anywhere yet in this plan's
-                        // scope -- reuse space_id as a readable fallback
-                        // title, matching the same pattern a later task's
-                        // local-mutation path uses for the same reason.
+                        // Use the title `open_conversation` was actually
+                        // called with (stored on `ActiveConversation`), not a
+                        // `space_id` fallback -- the title IS available
+                        // in-process for any conversation this branch can
+                        // even reach (it only runs when `state.active` has
+                        // an entry), so falling back to `space_id` here would
+                        // visibly clobber the frontend's real title the
+                        // moment any network change arrived for it.
                         let new_value =
-                            crate::commands::regenerate_spec_value(&state, &change.space_id, &change.space_id);
+                            crate::commands::regenerate_spec_value(&state, &change.space_id, &conversation.title);
                         conversation.live_spec.update(new_value);
                         let (version, _) = conversation.live_spec.snapshot();
                         let patch = conversation.live_spec.diff_since(version.saturating_sub(1));
@@ -666,5 +677,9 @@ mod tests {
         };
         assert_eq!(version, 1, "LiveSpec version should advance exactly once for the one incoming change");
         assert_eq!(spec["messages"][0]["content"], "from the network");
+        assert_eq!(
+            spec["title"], "General",
+            "the real title from open_conversation must survive a network-driven patch, not fall back to space_id"
+        );
     }
 }
