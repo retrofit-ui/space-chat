@@ -128,7 +128,10 @@ async fn when_actor_process_killed_and_relaunched(world: &mut SpaceChatWorld, na
     world.kill_actor(&name).await;
     assert!(
         world.actor(&name).running.is_none(),
-        "kill_actor left {name:?} still running -- the restart under test never actually happened"
+        "kill_actor did not clear {name:?}'s RunningActor -- later steps would resolve to a stale \
+         WebDriver session rather than the fresh one relaunch_actor is about to create (this checks \
+         the field kill_actor clears, not that the underlying OS process has actually died -- see \
+         kill_process_group for the real teardown signal)"
     );
     world.relaunch_actor(&name).await;
     // Cheap guard against the one way this whole scenario could pass for the
