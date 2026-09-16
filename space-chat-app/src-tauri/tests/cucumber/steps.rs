@@ -207,9 +207,25 @@ async fn when_attachment_becomes_available(world: &mut SpaceChatWorld, name: Str
 }
 
 /// The transition itself: the placeholder must be gone and the real `<img>`
-/// present. Asserting the placeholder's *disappearance* too (not just the
-/// image's appearance) is what makes this a transition rather than two
-/// unrelated elements coexisting.
+/// present AND actually decoded. Asserting the placeholder's
+/// *disappearance* too (not just the image's appearance) is what makes this
+/// a transition rather than two unrelated elements coexisting.
+///
+/// Checking element *presence* alone would pass even if the `<img>`'s `src`
+/// 404'd or the bytes weren't a real image at all -- an `<img>` element
+/// exists in the DOM regardless of whether it loaded. A bare
+/// `naturalWidth > 0` check ALSO isn't enough: Task 13's own cache-miss
+/// path (`handle_attachment_request`) deliberately returns the real,
+/// valid, decodable placeholder PNG (its own lazy-fetch policy), so a
+/// nonzero-width `<img>` doesn't distinguish "the real attachment arrived"
+/// from "still serving the fallback." `lib.rs`'s `simulate_attachment_arrival_for_testing`
+/// saves a 1x1 image deliberately different in size from the placeholder's
+/// 64x64 -- asserting the EXACT expected width is what actually proves the
+/// `spacechat://` request round-tripped the real bytes through the
+/// protocol handler, not just that a DOM node with the right
+/// `data-testid` showed up decoding some image or other.
+const EXPECTED_ARRIVED_WIDTH: i64 = 1;
+
 #[then(regex = r"^(\w+)'s conversation view shows the loaded attachment within (\d+) seconds$")]
 async fn then_shows_loaded_attachment(world: &mut SpaceChatWorld, name: String, seconds: u64) {
     let client = world.client(&name);
@@ -221,6 +237,31 @@ async fn then_shows_loaded_attachment(world: &mut SpaceChatWorld, name: String, 
         .unwrap_or_else(|e| {
             panic!("expected {name:?}'s conversation view to show a loaded attachment within {seconds}s: {e}")
         });
+
+    const NATURAL_WIDTH_SCRIPT: &str = r#"
+        const el = document.querySelector(arguments[0]);
+        return el ? el.naturalWidth : -1;
+    "#;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let width = client
+            .execute(NATURAL_WIDTH_SCRIPT, vec![serde_json::json!(ATTACHMENT_LOADED)])
+            .await
+            .unwrap_or_else(|e| panic!("could not read {name:?}'s attachment naturalWidth: {e}"));
+        let last_width = width.as_i64().unwrap_or(-1);
+        if last_width == EXPECTED_ARRIVED_WIDTH {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{name}'s loaded attachment <img> never decoded the expected {EXPECTED_ARRIVED_WIDTH}px-wide \
+             \"arrived\" image within {seconds}s -- last observed naturalWidth: {last_width} \
+             (0 means never decoded; the placeholder's own width would be 64, which would mean the \
+             real attachment bytes never actually replaced the fallback placeholder)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     let leftover = client
         .find_all(Locator::Css(ATTACHMENT_PLACEHOLDER))
         .await

@@ -97,7 +97,7 @@ async fn send_message_with_missing_attachment_for_testing(
         "here's an attachment".to_string(),
         vec![space_chat_core::domain::AttachmentRef {
             hash,
-            size: 12,
+            size: ARRIVED_ATTACHMENT_BYTES.len() as u64,
             mime: "image/png".to_string(),
             wrapped_key: vec![],
         }],
@@ -107,13 +107,39 @@ async fn send_message_with_missing_attachment_for_testing(
     Ok(hex_encode(&hash))
 }
 
-/// Writes fake bytes into the local `AttachmentBlobStore` for `hash_hex` (as if
-/// a real fetch-over-network had just completed) and emits the same
-/// `attachment-ready:<hash>` event Task 13's real (not-yet-built) fetch
-/// pipeline would eventually emit. `AttachmentImage` (Task 16) doesn't care how
-/// the bytes arrived, only that the event fires once they have -- so this is a
-/// faithful stand-in for the *frontend's* half of lazy fetch even though the
-/// transport half doesn't exist yet.
+/// A real, valid, DECODABLE 1x1 RGBA PNG -- deliberately NOT the same file
+/// Task 13's own placeholder response serves (a 64x64 grayscale PNG at
+/// `assets/attachment-placeholder.png`). Review found that using arbitrary
+/// non-image bytes (`b"fake image bytes for testing"`) let the scenario
+/// pass while proving nothing: `AttachmentImage`'s placeholder state
+/// renders a `<div>`, not an `<img>`, so no `spacechat://` request happens
+/// until `ready()` flips, and checking only the loaded `<img>` element's
+/// *presence* doesn't prove it decoded. The natural next fix -- checking
+/// `naturalWidth > 0` -- turned out to ALSO pass without this fix, for a
+/// subtler reason: `handle_attachment_request`'s cache-miss path returns
+/// the real placeholder PNG's bytes (status 200, valid, decodable) as a
+/// deliberate design choice (Task 13's own lazy-fetch policy), so a
+/// `naturalWidth` check alone can't tell "the real attachment arrived"
+/// apart from "still serving the fallback placeholder image" -- both
+/// decode fine. Using a 1x1 image here, distinct from the placeholder's
+/// 64x64, and asserting the loaded `<img>`'s exact dimensions (not just
+/// that they're nonzero) is what actually distinguishes the two.
+const ARRIVED_ATTACHMENT_BYTES: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49,
+    0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// Writes real (valid, decodable, 1x1) PNG bytes into the local
+/// `AttachmentBlobStore` for `hash_hex` (as if a real fetch-over-network had
+/// just completed) and emits the same `attachment-ready:<hash>` event Task
+/// 13's real (not-yet-built) fetch pipeline would eventually emit.
+/// `AttachmentImage` (Task 16) doesn't care how the bytes arrived, only
+/// that the event fires once they have -- so this is a faithful stand-in
+/// for the *frontend's* half of lazy fetch even though the transport half
+/// doesn't exist yet. See `ARRIVED_ATTACHMENT_BYTES`'s doc comment for why
+/// this must be a real, distinctly-sized image, not arbitrary bytes.
 #[tauri::command]
 async fn simulate_attachment_arrival_for_testing(
     state: tauri::State<'_, std::sync::Arc<state::AppState>>,
@@ -129,10 +155,15 @@ async fn simulate_attachment_arrival_for_testing(
     {
         use space_chat_core::storage::AttachmentBlobStore;
         let mut store = state.attachment_store.lock().map_err(|e| e.to_string())?;
-        store.save_attachment(&hash, b"fake image bytes for testing").map_err(|e| e.to_string())?;
+        store.save_attachment(&hash, ARRIVED_ATTACHMENT_BYTES).map_err(|e| e.to_string())?;
     }
     use tauri::Emitter;
-    let _ = app.emit(&events::attachment_ready_event_name(&hash_hex), ());
+    // `hash_hex` may arrive with different casing than what `AttachmentSpec`'s
+    // URL embeds (always lowercase, via `hex_encode`'s own `{b:02x}` format) --
+    // normalize before emitting, or an uppercase-hex caller would store under
+    // the correct hash but emit an event name the frontend isn't listening
+    // for, a silent no-op rather than an error.
+    let _ = app.emit(&events::attachment_ready_event_name(&hash_hex.to_lowercase()), ());
     Ok(())
 }
 
