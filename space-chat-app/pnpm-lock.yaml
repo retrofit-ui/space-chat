@@ -17,6 +17,9 @@ importers:
       '@shoelace-style/shoelace':
         specifier: ^2.20.0
         version: 2.20.1(@floating-ui/utils@0.2.12)(@types/react@19.3.0)
+      '@solidjs/router':
+        specifier: ^0.15.4
+        version: 0.15.4(solid-js@1.9.15)
       '@tauri-apps/api':
         specifier: ^2
         version: 2.11.1
@@ -29,7 +32,7 @@ importers:
     devDependencies:
       '@solidjs/testing-library':
         specifier: ^0.8.10
-        version: 0.8.10(solid-js@1.9.15)
+        version: 0.8.10(@solidjs/router@0.15.4(solid-js@1.9.15))(solid-js@1.9.15)
       '@tauri-apps/cli':
         specifier: ^2
         version: 2.11.4
@@ -676,6 +679,11 @@ packages:
   '@shoelace-style/shoelace@2.20.1':
     resolution: {integrity: sha512-FSghU95jZPGbwr/mybVvk66qRZYpx5FkXL+vLNpy1Vp8UsdwSxXjIHE3fsvMbKWTKi9UFfewHTkc5e7jAqRYoQ==}
     engines: {node: '>=14.17.0'}
+
+  '@solidjs/router@0.15.4':
+    resolution: {integrity: sha512-WOpgg9a9T638cR+5FGbFi/IV4l2FpmBs1GpIMSPa0Ce9vyJN7Wts+X2PqMf9IYn0zUj2MlSJtm1gp7/HI/n5TQ==}
+    peerDependencies:
+      solid-js: ^1.8.6
 
   '@solidjs/testing-library@0.8.10':
     resolution: {integrity: sha512-qdeuIerwyq7oQTIrrKvV0aL9aFeuwTd86VYD3afdq5HYEwoox1OBTJy4y8A3TFZr8oAR0nujYgCzY/8wgHGfeQ==}
@@ -1929,10 +1937,16 @@ snapshots:
       - '@floating-ui/utils'
       - '@types/react'
 
-  '@solidjs/testing-library@0.8.10(solid-js@1.9.15)':
+  '@solidjs/router@0.15.4(solid-js@1.9.15)':
+    dependencies:
+      solid-js: 1.9.15
+
+  '@solidjs/testing-library@0.8.10(@solidjs/router@0.15.4(solid-js@1.9.15))(solid-js@1.9.15)':
     dependencies:
       '@testing-library/dom': 10.4.2
       solid-js: 1.9.15
+    optionalDependencies:
+      '@solidjs/router': 0.15.4(solid-js@1.9.15)
 
   '@tauri-apps/api@2.11.1': {}
 
