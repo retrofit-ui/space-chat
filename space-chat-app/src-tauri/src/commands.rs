@@ -208,12 +208,28 @@ async fn mutate_and_persist(
 pub async fn send_message_impl(state: &AppState, space_id: &str, content: String) -> Result<(), String> {
     let local_device = state.local_device;
     mutate_and_persist(state, space_id, move |segment| {
-        segment.append_message(&Message {
+        let new_obj_id = segment.append_message(&Message {
             sender: local_device,
             content,
             attachments: vec![],
         });
-        vec![segment.message_keys().last().unwrap_or_default()]
+        // NOT `segment.message_keys().last()`: `message_keys()`'s own doc
+        // comment states it iterates "in no particular order" (Automerge
+        // maps don't preserve insertion order). With only one message in a
+        // space, `.last()` happens to return the right key by coincidence
+        // -- which is exactly why this shipped without being caught: every
+        // test that exercised this path sent only one message per space.
+        // Sending a second message to the same space can make `.last()`
+        // return a PREVIOUSLY-created message's key instead of the new
+        // one, silently mis-assigning `seq`/listing order to the wrong
+        // message. Fixed by finding the key whose ObjId matches what
+        // `append_message` actually returned -- a value comparison, so it's
+        // correct regardless of `message_keys()`'s iteration order.
+        segment
+            .message_keys()
+            .find(|key| segment.message(key).as_ref() == Some(&new_obj_id))
+            .map(|key| vec![key])
+            .unwrap_or_default()
     })
     .await?;
     Ok(())
