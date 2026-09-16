@@ -5723,6 +5723,7 @@ name = "space-chat-app"
 version = "0.1.0"
 dependencies = [
  "automerge",
+ "base64 0.22.1",
  "iroh",
  "json-patch 4.2.0",
  "redb",

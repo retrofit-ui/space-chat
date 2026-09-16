@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod conversation_spec;
 pub mod events;
+pub mod invite;
 pub mod live_spec;
 pub mod membership;
 pub mod network;
@@ -54,6 +55,9 @@ pub fn run() {
             commands::react,
             commands::delete_message,
             commands::fetch_older_page,
+            commands::create_space,
+            commands::generate_invite,
+            commands::join_via_invite,
         ])
         .run(tauri::generate_context!())
         .expect("error while running space-chat-app");

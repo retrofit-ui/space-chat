@@ -404,8 +404,27 @@ fn emit_patch_if_active(app: &tauri::AppHandle, state: &AppState, space_id: &str
     let _ = app.emit(&crate::events::conversation_patch_event_name(space_id), event);
 }
 
+#[tauri::command]
+pub async fn create_space(state: tauri::State<'_, std::sync::Arc<AppState>>, title: String) -> Result<String, String> {
+    Ok(crate::invite::create_space_impl(&state, title).await)
+}
+
+#[tauri::command]
+pub async fn generate_invite(state: tauri::State<'_, std::sync::Arc<AppState>>, space_id: String) -> Result<String, String> {
+    Ok(crate::invite::generate_invite_impl(&state, &space_id).await)
+}
+
+#[tauri::command]
+pub async fn join_via_invite(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+    invite_token: String,
+    local_display_name: String,
+) -> Result<String, String> {
+    crate::invite::join_via_invite_impl(&state, &invite_token, &local_display_name).await
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::membership::SpaceMembership;
     use crate::network::AppNetwork;
@@ -434,6 +453,10 @@ mod tests {
         let (network, events) = inert_network().await;
         let state = AppState::new(dir.path(), DeviceId([1u8; 32]), network, events, mock_app_handle()).unwrap();
         (dir, state)
+    }
+
+    pub(crate) async fn fresh_state_for_invite_tests() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        fresh_state().await
     }
 
     fn seed_one_message(state: &AppState, space_id: &str) {
