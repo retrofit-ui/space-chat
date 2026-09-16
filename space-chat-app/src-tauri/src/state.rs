@@ -229,6 +229,16 @@ impl AppState {
 /// any conversation view), at the cost of their relative order among each
 /// other, within one batch, not being guaranteed chronological. Tracked here
 /// explicitly rather than silently assumed correct.
+///
+/// The worst case isn't just "a few messages arriving close together": the
+/// FIRST sync with any peer delivers a space's entire prior history in one
+/// `IncomingChange`, so a brand-new device's whole transcript renders in
+/// whatever order `message_keys()` happens to iterate (effectively UUID
+/// order, since message keys embed a `uuid::Uuid`) rather than send order.
+/// It also means two devices can each assign different `seq` numbers to the
+/// same messages, since `seq` here is assigned in THIS device's own
+/// observation order, not a value agreed with any peer -- two devices in the
+/// same space are not guaranteed to display transcripts in the same order.
 fn append_new_listing_entries(listing: &mut RedbListingIndex, space_id: &str, epoch: u64, message_keys: &[String]) {
     use space_chat_core::storage::ListingEntry;
 
@@ -237,7 +247,12 @@ fn append_new_listing_entries(listing: &mut RedbListingIndex, space_id: &str, ep
     let mut before: Option<(u64, u64)> = None;
     const BATCH: usize = 200;
     loop {
-        let Ok(page) = listing.page(space_id, before, BATCH) else { break };
+        // Bail out of the WHOLE function (not just this loop) on a scan
+        // failure -- proceeding to the append loop below with only a
+        // partial `existing_keys` set would silently re-append entries
+        // already indexed in the unscanned remainder, rather than skipping
+        // them as intended.
+        let Ok(page) = listing.page(space_id, before, BATCH) else { return };
         if page.is_empty() {
             break;
         }
@@ -287,7 +302,21 @@ fn spawn_network_event_loop<R: tauri::Runtime>(
     mut events: mpsc::UnboundedReceiver<TransportEvent>,
     _app_handle: tauri::AppHandle<R>,
 ) {
-    tokio::spawn(async move {
+    // NOT `tokio::spawn`: `AppState::new` (this function's only caller) runs
+    // synchronously, outside of any `tauri::async_runtime::block_on(..)`
+    // call, when invoked from `run()`'s `.setup()` closure (a plain,
+    // non-async Tauri callback) -- there is no ambient tokio runtime context
+    // at that point (`bare tokio::spawn` panics with "there is no reactor
+    // running" here, confirmed empirically), since `main.rs` has no
+    // `#[tokio::main]` and the enclosing `block_on` call that bound
+    // `AppNetwork` has already returned by the time this runs.
+    // `tauri::async_runtime::spawn` instead dispatches onto Tauri's own
+    // lazily-initialized global runtime handle regardless of the calling
+    // thread's context, which is what every test in this file's `#[tokio::test]`
+    // context was silently relying on tokio's own ambient runtime to paper
+    // over -- no test exercises `run()` itself, so this bug was invisible to
+    // the whole suite.
+    tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
                 TransportEvent::IncomingChange(change) => {
@@ -295,7 +324,19 @@ fn spawn_network_event_loop<R: tauri::Runtime>(
                         let arc = state.segment_arc(&change.space_id).await;
                         let mut seg = arc.lock().await;
                         let bytes = seg.save();
-                        let message_keys: Vec<String> = seg.message_keys().collect();
+                        // `message_keys()`'s own doc comment warns it includes
+                        // keys that are malformed when passed to `message()`
+                        // -- filter those out here (mirroring `message_count`'s
+                        // own filtering) rather than indexing them: an
+                        // unfiltered malformed key would make
+                        // `build_conversation_spec` return
+                        // `SpecBuildError::MalformedMessage` for the ENTIRE
+                        // page it's on, permanently, since a peer-asserted key
+                        // can never become well-formed after the fact.
+                        let message_keys: Vec<String> = seg
+                            .message_keys()
+                            .filter(|key| seg.message(key).is_some())
+                            .collect();
                         (bytes, message_keys)
                     };
                     if let Ok(mut store) = state.segment_store.lock() {
@@ -357,6 +398,38 @@ mod tests {
         let db = std::sync::Arc::new(redb::Database::open(&db_path).unwrap());
         let store = RedbObservedAtStore::new(db).unwrap();
         assert_eq!(store.get("msg:1"), Some(1234));
+    }
+
+    /// Deliberately NOT `#[tokio::test]`: a `tokio::test` supplies an
+    /// ambient tokio runtime context for the whole test body, which would
+    /// mask exactly the bug this test exists to catch. `run()`'s real
+    /// startup sequence calls `tauri::async_runtime::block_on(..)` to bind
+    /// `AppNetwork` (which returns, tearing down its ambient context) and
+    /// THEN calls `AppState::new` synchronously, outside of that -- from
+    /// Tauri's own non-async `.setup()` closure, with no ambient tokio
+    /// runtime on that thread at all. `AppState::new` spawns the network
+    /// event loop; a plain `tokio::spawn` call in that position panics
+    /// ("there is no reactor running") since there is no runtime context to
+    /// spawn onto -- this regression was caught by review, not by any
+    /// `#[tokio::test]` in this file, precisely because every other test
+    /// here supplies the context that masks it. Fixed by using
+    /// `tauri::async_runtime::spawn` (which reaches Tauri's own
+    /// independently-initialized runtime handle) instead of bare
+    /// `tokio::spawn` in `spawn_network_event_loop`.
+    #[test]
+    fn app_state_new_can_be_constructed_outside_any_tokio_runtime_context() {
+        use space_chat_transport::bootstrap::TransportConfig;
+        use space_chat_transport::identity::TransportIdentity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity = TransportIdentity::generate();
+        let (network, events) =
+            tauri::async_runtime::block_on(AppNetwork::bind(&identity, TransportConfig { relay: None })).unwrap();
+
+        // This call must not panic: it happens on a plain thread with no
+        // ambient tokio runtime, exactly mirroring run()'s real call site.
+        let state = AppState::new(dir.path(), DeviceId([1u8; 32]), network, events, mock_app_handle()).unwrap();
+        assert_eq!(state.active.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
