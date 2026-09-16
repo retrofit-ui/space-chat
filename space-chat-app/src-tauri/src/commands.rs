@@ -321,16 +321,21 @@ pub struct OlderPageResult {
 pub async fn fetch_older_page_impl(
     state: &AppState,
     space_id: &str,
-    before_epoch: u64,
-    before_seq: u64,
+    before_epoch: Option<u64>,
+    before_seq: Option<u64>,
     limit: usize,
 ) -> Result<OlderPageResult, String> {
     use space_chat_core::storage::ListingIndex;
 
-    let before = if before_epoch == u64::MAX && before_seq == u64::MAX {
-        None
-    } else {
-        Some((before_epoch, before_seq))
+    // `Option<u64>`, not a `u64::MAX` sentinel: `u64::MAX` cannot round-trip
+    // through Tauri's JSON-based IPC, since JavaScript's `Number` type can't
+    // represent it exactly (`JSON.stringify(18446744073709551615n)` doesn't
+    // even apply -- a plain JS `Number` silently rounds it to
+    // 18446744073709551616, which then fails serde's `u64` deserialization
+    // on the Rust side). `None`/`null`/`undefined` round-trips correctly.
+    let before = match (before_epoch, before_seq) {
+        (Some(e), Some(s)) => Some((e, s)),
+        _ => None,
     };
 
     let page = state
@@ -371,8 +376,8 @@ pub async fn fetch_older_page_impl(
 pub async fn fetch_older_page(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
     space_id: String,
-    before_epoch: u64,
-    before_seq: u64,
+    before_epoch: Option<u64>,
+    before_seq: Option<u64>,
     limit: usize,
 ) -> Result<OlderPageResult, String> {
     fetch_older_page_impl(&state, &space_id, before_epoch, before_seq, limit).await
@@ -629,7 +634,7 @@ mod tests {
         }
 
         // Page 1: newest 2.
-        let page1 = fetch_older_page_impl(&state, "space-1", u64::MAX, u64::MAX, 2).await.unwrap();
+        let page1 = fetch_older_page_impl(&state, "space-1", None, None, 2).await.unwrap();
         assert_eq!(page1.messages.len(), 2);
         assert_eq!(page1.messages[0].content, "two");
         assert_eq!(page1.messages[1].content, "three");
@@ -642,8 +647,46 @@ mod tests {
         state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
         send_message_impl(&state, "space-1", "only one".to_string()).await.unwrap();
 
-        let page = fetch_older_page_impl(&state, "space-1", u64::MAX, u64::MAX, 10).await.unwrap();
+        let page = fetch_older_page_impl(&state, "space-1", None, None, 10).await.unwrap();
         assert_eq!(page.messages.len(), 1);
         assert!(!page.has_more_older);
+    }
+
+    /// Regression test for a real bug found via `fetch_older_page`'s own
+    /// multi-message test (this test lives at the right layer instead --
+    /// `send_message_impl` itself, so a future refactor of pagination can't
+    /// accidentally stop covering it): `send_message_impl` used to identify
+    /// "the message it just created" via `segment.message_keys().last()`,
+    /// but that iterates in no particular order (Automerge maps, not
+    /// insertion-ordered). Sending N messages to the same space must
+    /// produce N distinct listing entries whose content matches send order
+    /// -- not fewer (duplicates/overwrites) and not out of order.
+    #[tokio::test]
+    async fn sending_multiple_messages_indexes_each_one_exactly_once_in_send_order() {
+        use space_chat_core::storage::ListingIndex;
+
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+
+        let contents: Vec<String> = (0..10).map(|i| format!("message-{i}")).collect();
+        for content in &contents {
+            send_message_impl(&state, "space-1", content.clone()).await.unwrap();
+        }
+
+        let page = state.listing_index.lock().unwrap().page("space-1", None, 100).unwrap();
+        assert_eq!(page.len(), 10, "each send must produce exactly one listing entry, no duplicates and no drops");
+
+        let keys: std::collections::HashSet<&str> = page.iter().map(|e| e.message_key.as_str()).collect();
+        assert_eq!(keys.len(), 10, "all 10 listing entries must reference distinct message keys");
+
+        let segments = state.segments_for("space-1");
+        let segment = &segments[&0];
+        // page() is newest-first; reverse to send order for comparison.
+        let ordered_contents: Vec<String> = page
+            .iter()
+            .rev()
+            .map(|e| segment.read_message(&e.message_key).unwrap().content)
+            .collect();
+        assert_eq!(ordered_contents, contents, "listing order must match send order");
     }
 }
