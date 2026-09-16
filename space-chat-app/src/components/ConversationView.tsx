@@ -1,5 +1,6 @@
 import { type Component, For, Show } from "solid-js";
 import type { ConversationSpec } from "../spec";
+import AttachmentImage from "./AttachmentImage";
 
 const ConversationView: Component<{ spec: ConversationSpec }> = (props) => {
   return (
@@ -15,9 +16,7 @@ const ConversationView: Component<{ spec: ConversationSpec }> = (props) => {
                 <p class="content">{message.content}</p>
               </Show>
               <For each={message.attachments}>
-                {(attachment) => (
-                  <img class="attachment-image" src={attachment.url} alt="attachment" data-mime={attachment.mime} />
-                )}
+                {(attachment) => <AttachmentImage url={attachment.url} mime={attachment.mime} />}
               </For>
               <div class="reactions">
                 <For each={message.reactions}>
