@@ -63,8 +63,17 @@ const PLACEHOLDER_BYTES: &[u8] = include_bytes!("../assets/attachment-placeholde
 /// asynchronously inside `.setup()`, per Task 8). Instead, every request
 /// looks up the already-`.manage()`d state fresh via the handler's own
 /// `UriSchemeContext::app_handle()` -- safe because no URI scheme request
-/// can arrive before `.setup()` has run (the webview that would make one
-/// doesn't load until after `.setup()` completes and calls `.manage()`).
+/// can arrive before this. Tauri's internal setup sequence (confirmed
+/// against the pinned tauri 2.11.5 source, `app.rs`'s private `setup` fn)
+/// actually creates the configured window BEFORE running the user's
+/// `.setup()` closure -- but window creation just constructs the native
+/// webview and points it at a URL; the underlying webview engine
+/// (webkit2gtk/WebView2/WKWebView) doesn't dispatch any resource request,
+/// custom-protocol or otherwise, until control returns to its own event
+/// loop, which only happens after the ENTIRE synchronous `Ready`-event
+/// handler -- window creation *and* the user's `.setup()` closure,
+/// including its `.manage()` call -- has returned. So by the time any
+/// `spacechat://` request is actually serviced, state is always managed.
 pub fn register_attachment_protocol(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder.register_asynchronous_uri_scheme_protocol("spacechat", move |ctx, request, responder| {
         use tauri::Manager;
