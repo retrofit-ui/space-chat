@@ -257,6 +257,10 @@ pub fn run() {
             // `AppState`/its storage currently come after `bind`).
             tauri::async_runtime::block_on(app_state.segment_arc(DEFAULT_SPACE_ID));
             announce_and_dial_from_env(&app_state.network);
+            // Must come BEFORE `app.manage(app_state)`: `subscribe_status()`
+            // borrows `app_state.network`, and `manage` takes `app_state` by
+            // value.
+            spawn_connection_status_bridge(app.handle().clone(), app_state.network.subscribe_status());
             app.manage(app_state);
             Ok(())
         })
@@ -278,6 +282,49 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running space-chat-app");
+}
+
+/// Bridges `AppNetwork::subscribe_status`'s watch channel to a Tauri event so
+/// the frontend can show a "reconnecting" affordance -- the app-shell spec's
+/// Composition & Tauri IPC section asks for this, and Task 7 built
+/// `subscribe_status()` for it, but nothing consumed it until now. Runs for
+/// the app's lifetime; `AppState.network` never changes after startup in this
+/// plan's scope, so there is nothing to re-subscribe to.
+///
+/// The payload is `format!("{status:?}")` -- i.e. the literal strings
+/// `"Connected"` / `"Disconnected"`, which `App.tsx` renders verbatim.
+///
+/// Emits the CURRENT value first and only then awaits changes, so a listener
+/// attached before this task starts sees a value without waiting for a
+/// transition. A listener that attaches later (the webview's `onMount` races
+/// this) can miss that first emit; the frontend's signal therefore defaults to
+/// the same `Disconnected` initial value `watch::channel` is seeded with in
+/// `network.rs`, so the two agree either way.
+///
+/// `tauri::async_runtime::spawn`, not bare `tokio::spawn` -- this is called
+/// from inside `run()`'s non-async `.setup()` closure, where no ambient tokio
+/// runtime is guaranteed (the same hazard `announce_and_dial_from_env` and
+/// `state.rs`'s `spawn_network_event_loop` both document, caught empirically
+/// there).
+///
+/// Generic over `R: tauri::Runtime` for the same reason `state.rs`'s
+/// `spawn_network_event_loop` is: a bare `tauri::AppHandle` defaults to the
+/// `Wry` runtime, which `tauri::test::mock_builder()` can't produce, so the
+/// non-generic form would be untestable.
+fn spawn_connection_status_bridge<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    mut status_rx: tokio::sync::watch::Receiver<network::ConnectionStatus>,
+) {
+    tauri::async_runtime::spawn(async move {
+        use tauri::Emitter;
+        loop {
+            let status = *status_rx.borrow();
+            let _ = app_handle.emit(events::connection_status_event_name(), format!("{status:?}"));
+            if status_rx.changed().await.is_err() {
+                break; // sender dropped -- AppNetwork (and the whole app) is shutting down
+            }
+        }
+    });
 }
 
 fn dirs_data_dir() -> std::path::PathBuf {
@@ -703,6 +750,49 @@ mod tests {
 
         connected.expect("the dialer should connect to the endpoint it read from SPACECHAT_DIAL_ADDRS");
         assert!(dialer_file.exists(), "the dialer should also have announced its own endpoint id");
+    }
+
+    /// The behaviour that actually matters for the "reconnecting" affordance,
+    /// which `events::tests`' name-stability test cannot reach: the bridge
+    /// emits the watch channel's CURRENT value immediately (so a listener
+    /// that attached first isn't left blank until the next transition) and
+    /// then one event per subsequent change, with the `Debug`-formatted
+    /// payload `App.tsx` renders verbatim.
+    ///
+    /// Drives a plain `watch::channel` rather than a real `AppNetwork` on
+    /// purpose -- `network.rs` already has its own test proving
+    /// `subscribe_status()` reaches `Connected` after a real dial over a real
+    /// relay; what's unproven is this function's half of the seam.
+    #[tokio::test]
+    async fn connection_status_bridge_emits_the_current_status_then_every_change() {
+        use std::time::Duration;
+        use tauri::Listener;
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        let (status_tx, status_rx) = tokio::sync::watch::channel(network::ConnectionStatus::Disconnected);
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        app.handle().listen(events::connection_status_event_name(), move |event| {
+            let _ = seen_tx.send(event.payload().to_string());
+        });
+
+        spawn_connection_status_bridge(app.handle().clone(), status_rx);
+
+        async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the bridge should have emitted a connection-status event")
+                .expect("the emit channel should still be open")
+        }
+
+        // Payloads are JSON-encoded by `emit`, so a Rust `String` arrives
+        // quoted -- this is exactly what the frontend's `event.payload` is.
+        assert_eq!(next(&mut seen_rx).await, "\"Disconnected\"", "the initial value must be emitted up front");
+        status_tx.send(network::ConnectionStatus::Connected).unwrap();
+        assert_eq!(next(&mut seen_rx).await, "\"Connected\"");
+        status_tx.send(network::ConnectionStatus::Disconnected).unwrap();
+        assert_eq!(next(&mut seen_rx).await, "\"Disconnected\"");
     }
 
     /// IPC-level test: dispatches `greet` through Tauri's real invoke pipeline
