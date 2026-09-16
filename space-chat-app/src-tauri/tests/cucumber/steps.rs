@@ -95,6 +95,54 @@ async fn when_actor_sends_message(world: &mut SpaceChatWorld, name: String, cont
     button.click().await.unwrap_or_else(|e| panic!("could not click {name}'s send button: {e}"));
 }
 
+/// Delegates to the existing `when_actor_sends_message` step function -- same
+/// real send path (composer input + send button, through the real running
+/// app), just phrased as a `Given` (a precondition for this scenario) rather
+/// than a `When` (the thing under test, which is the restart, not the send).
+#[given(regex = r#"^(\w+) has sent the message "([^"]+)"$"#)]
+async fn given_actor_has_sent_message(world: &mut SpaceChatWorld, name: String, content: String) {
+    when_actor_sends_message(world, name, content).await;
+}
+
+/// Models the app-shell spec's "kill and restart the core mid-session" as
+/// killing and relaunching the whole `space-chat-app` process against the same
+/// on-disk data directory -- `space-chat-core` runs embedded in that process
+/// and has no separate backend to kill independently.
+///
+/// `kill_actor`/`relaunch_actor` (Task 17) already do exactly this: the kill
+/// signals the actor's whole process group (`xvfb-run` -> `tauri-driver` ->
+/// `WebKitWebDriver` -> app) while keeping the actor's `TempDir` alive, and the
+/// relaunch spawns a brand-new process tree -- new driver, new WebDriver
+/// session, new webview -- pointed at that same `SPACECHAT_DATA_DIR`, waiting
+/// for a freshly published endpoint id before returning. Nothing of the old
+/// process (in-memory `AppState`, live-spec subscription, rendered DOM)
+/// survives; the only thing carried across is what was written to disk.
+///
+/// The `client(..)` every later step calls is resolved through the actor's
+/// CURRENT `RunningActor`, so the post-restart assertion necessarily runs
+/// against the new session -- there is no way for it to accidentally re-read
+/// the killed webview.
+#[when(regex = r"^(\w+)'s app process is killed and relaunched against the same data directory$")]
+async fn when_actor_process_killed_and_relaunched(world: &mut SpaceChatWorld, name: String) {
+    let data_dir_before = world.actor(&name).data_dir.path().to_path_buf();
+    world.kill_actor(&name).await;
+    assert!(
+        world.actor(&name).running.is_none(),
+        "kill_actor left {name:?} still running -- the restart under test never actually happened"
+    );
+    world.relaunch_actor(&name).await;
+    // Cheap guard against the one way this whole scenario could pass for the
+    // wrong reason: a "relaunch" that quietly started against a DIFFERENT (or
+    // wiped) directory would prove nothing about on-disk recovery, and a
+    // relaunch that reused the old process would prove nothing about restart
+    // at all.
+    assert_eq!(
+        world.actor(&name).data_dir.path(),
+        data_dir_before,
+        "the relaunched {name:?} must be pointed at the same on-disk data directory as before the kill"
+    );
+}
+
 /// Polls the receiving actor's REAL rendered DOM (not its backend state) until
 /// the message shows up, or the scenario's stated bound elapses.
 ///
