@@ -137,6 +137,186 @@ pub async fn resync_conversation(
     resync_conversation_impl(&state, &space_id, since_version).await
 }
 
+use space_chat_core::domain::{Delete, Message, Reaction};
+use space_chat_core::segment::{objid_to_target_string, Segment};
+use space_chat_core::storage::{ListingEntry, ListingIndex, SegmentBlobStore};
+
+const CURRENT_EPOCH: u64 = 0; // epoch rollover is out of scope for this plan
+
+/// Locks the shared `Segment` handle for `(space_id, CURRENT_EPOCH)` (the
+/// SAME handle `Transport`'s own sync loop mutates -- see `AppState::segment_arc`),
+/// runs `mutate` against it, persists the result, appends `new_message_keys`
+/// to `ListingIndex` in order, notifies `Transport` so any parked sync tasks
+/// wake immediately, and -- if this conversation is actively viewed --
+/// regenerates its spec and returns the patch that should be pushed to the
+/// frontend (the `#[tauri::command]` wrappers below do the actual emitting,
+/// keeping this function testable without a live `tauri::AppHandle`).
+async fn mutate_and_persist(
+    state: &AppState,
+    space_id: &str,
+    mutate: impl FnOnce(&mut Segment) -> Vec<String>, // returns any newly-created message keys, in order
+) -> Result<Option<PatchResponse>, String> {
+    let arc = state.segment_arc(space_id).await;
+    let new_message_keys = {
+        let mut segment = arc.lock().await;
+        let new_message_keys = mutate(&mut segment);
+        let change = segment.latest_change();
+        state
+            .segment_store
+            .lock()
+            .unwrap()
+            .save_segment(space_id, CURRENT_EPOCH, change.cursor.0, &change.bytes)
+            .map_err(|e| e.to_string())?;
+        new_message_keys
+    }; // segment guard dropped here -- must not be held across notify_local_change's .await
+
+    {
+        let mut listing = state.listing_index.lock().unwrap();
+        let mut next_seq = listing
+            .page(space_id, None, 1)
+            .ok()
+            .and_then(|page| page.first().map(|e| e.seq + 1))
+            .unwrap_or(0);
+        for key in new_message_keys {
+            listing
+                .append_entry(ListingEntry {
+                    space_id: space_id.to_string(),
+                    epoch: CURRENT_EPOCH,
+                    seq: next_seq,
+                    message_key: key,
+                })
+                .map_err(|e| e.to_string())?;
+            next_seq += 1;
+        }
+    }
+
+    state.network.transport.notify_local_change(space_id).await;
+
+    let active = state.active.lock().unwrap();
+    if let Some(conversation) = active.get(space_id) {
+        // Use the REAL title stored on ActiveConversation (Task 9's fix),
+        // not a space_id fallback -- see this brief's Gap 4.
+        let new_value = regenerate_spec_value(state, space_id, &conversation.title);
+        conversation.live_spec.update(new_value);
+        let (version, _) = conversation.live_spec.snapshot();
+        return Ok(Some(conversation.live_spec.diff_since(version.saturating_sub(1))));
+    }
+
+    Ok(None)
+}
+
+pub async fn send_message_impl(state: &AppState, space_id: &str, content: String) -> Result<(), String> {
+    let local_device = state.local_device;
+    mutate_and_persist(state, space_id, move |segment| {
+        segment.append_message(&Message {
+            sender: local_device,
+            content,
+            attachments: vec![],
+        });
+        vec![segment.message_keys().last().unwrap_or_default()]
+    })
+    .await?;
+    Ok(())
+}
+
+pub async fn react_impl(
+    state: &AppState,
+    space_id: &str,
+    message_key: &str,
+    emoji: &str,
+) -> Result<(), String> {
+    let local_device = state.local_device;
+    let emoji = emoji.to_string();
+    let message_key = message_key.to_string();
+    mutate_and_persist(state, space_id, move |segment| {
+        let Some(msg_id) = segment.message(&message_key) else {
+            return vec![];
+        };
+        let _ = segment.append_reaction(
+            &msg_id,
+            &Reaction {
+                target: objid_to_target_string(&msg_id),
+                actor: local_device,
+                emoji,
+            },
+        );
+        vec![]
+    })
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_message_impl(state: &AppState, space_id: &str, message_key: &str) -> Result<(), String> {
+    let message_key = message_key.to_string();
+    mutate_and_persist(state, space_id, move |segment| {
+        let Some(msg_id) = segment.message(&message_key) else {
+            return vec![];
+        };
+        let _ = segment.apply_delete(&msg_id, &Delete { target: objid_to_target_string(&msg_id) });
+        vec![]
+    })
+    .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn send_message(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+    app: tauri::AppHandle,
+    space_id: String,
+    content: String,
+) -> Result<(), String> {
+    send_message_impl(&state, &space_id, content).await?;
+    emit_patch_if_active(&app, &state, &space_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn react(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+    app: tauri::AppHandle,
+    space_id: String,
+    message_key: String,
+    emoji: String,
+) -> Result<(), String> {
+    react_impl(&state, &space_id, &message_key, &emoji).await?;
+    emit_patch_if_active(&app, &state, &space_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_message(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+    app: tauri::AppHandle,
+    space_id: String,
+    message_key: String,
+) -> Result<(), String> {
+    delete_message_impl(&state, &space_id, &message_key).await?;
+    emit_patch_if_active(&app, &state, &space_id);
+    Ok(())
+}
+
+/// Looks up the current patch for `space_id` (if it's actively viewed) and
+/// emits it on `crate::events::conversation_patch_event_name`. Takes a bare
+/// (non-generic) `tauri::AppHandle` -- unlike `state.rs`'s network event
+/// loop (which had to be generic over `R: tauri::Runtime` to stay testable
+/// with `MockRuntime`), this function is only ever called from real
+/// `#[tauri::command]` handlers dispatched by the actual Tauri runtime, and
+/// is not itself unit-tested with a mock handle (matching how Task 9's own
+/// command wrappers were left untested at the IPC layer -- only their
+/// `_impl` functions have unit tests). If a later task adds IPC-level tests
+/// for these commands, revisit whether this needs to become generic too.
+fn emit_patch_if_active(app: &tauri::AppHandle, state: &AppState, space_id: &str) {
+    use tauri::Emitter;
+
+    let active = state.active.lock().unwrap();
+    let Some(conversation) = active.get(space_id) else { return };
+    let (version, _) = conversation.live_spec.snapshot();
+    let patch = conversation.live_spec.diff_since(version.saturating_sub(1));
+    let event = crate::events::ConversationPatchEvent { space_id: space_id.to_string(), patch };
+    let _ = app.emit(&crate::events::conversation_patch_event_name(space_id), event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +466,75 @@ mod tests {
             state.active_segments.lock().await.contains_key("space-1"),
             "open_conversation_impl must register the space with Transport via segment_arc"
         );
+    }
+
+    #[tokio::test]
+    async fn send_message_appends_a_message_and_it_shows_up_in_the_active_spec() {
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+        open_conversation_impl(&state, "space-1", "General", 10_000).await;
+
+        send_message_impl(&state, "space-1", "hello world".to_string()).await.unwrap();
+
+        let active = state.active.lock().unwrap();
+        let (_, spec_value) = active.get("space-1").unwrap().live_spec.snapshot();
+        assert_eq!(spec_value["messages"][0]["content"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn send_message_persists_across_a_fresh_segment_load() {
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+
+        send_message_impl(&state, "space-1", "persisted".to_string()).await.unwrap();
+
+        let segments = state.segments_for("space-1");
+        assert_eq!(segments[&0].message_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn react_and_delete_apply_to_an_existing_message() {
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+        send_message_impl(&state, "space-1", "react to me".to_string()).await.unwrap();
+
+        let segments = state.segments_for("space-1");
+        let message_key = segments[&0].message_keys().next().unwrap();
+
+        react_impl(&state, "space-1", &message_key, "\u{1F44D}").await.unwrap();
+        delete_message_impl(&state, "space-1", &message_key).await.unwrap();
+
+        let segments = state.segments_for("space-1");
+        let msg_id = segments[&0].message(&message_key).unwrap();
+        assert_eq!(segments[&0].reaction_count(&msg_id), 1);
+        assert!(segments[&0].is_deleted(&msg_id));
+    }
+
+    #[tokio::test]
+    async fn send_message_on_an_unopened_conversation_still_succeeds_without_a_live_spec() {
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+
+        let result = send_message_impl(&state, "space-1", "no active view".to_string()).await;
+
+        assert!(result.is_ok());
+        assert!(!state.active.lock().unwrap().contains_key("space-1"));
+    }
+
+    /// New test, not in the original plan text: proves the network layer is
+    /// actually notified (Gap 2/Task 7's `notify_local_change`), and that
+    /// this task didn't reintroduce Task 9's title-clobber bug (Gap 4) for
+    /// the local-mutation path.
+    #[tokio::test]
+    async fn send_message_preserves_the_real_title_when_regenerating_the_active_spec() {
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+        open_conversation_impl(&state, "space-1", "General", 10_000).await;
+
+        send_message_impl(&state, "space-1", "hello".to_string()).await.unwrap();
+
+        let active = state.active.lock().unwrap();
+        let (_, spec_value) = active.get("space-1").unwrap().live_spec.snapshot();
+        assert_eq!(spec_value["title"], "General", "title must not fall back to space_id after a local mutation");
     }
 }

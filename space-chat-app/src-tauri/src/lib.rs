@@ -49,7 +49,10 @@ pub fn run() {
             greet,
             commands::open_conversation,
             commands::close_conversation,
-            commands::resync_conversation
+            commands::resync_conversation,
+            commands::send_message,
+            commands::react,
+            commands::delete_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running space-chat-app");
