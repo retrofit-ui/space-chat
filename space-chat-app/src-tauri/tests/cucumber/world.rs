@@ -231,6 +231,17 @@ impl SpaceChatWorld {
         let data_dir = actor.data_dir.path().to_path_buf();
         let endpoint_addr_file = actor.endpoint_addr_file.clone();
 
+        // Clear any stale endpoint-id file from a PRIOR launch of this same
+        // actor before spawning -- relaunch_actor calls this same function
+        // against an actor whose data_dir (and therefore endpoint_addr_file)
+        // already exists from before it was killed. Without this,
+        // wait_for_endpoint_file below would return instantly against the
+        // OLD file, before the new process has published anything -- and any
+        // peer dialing this actor via SPACECHAT_DIAL_ADDRS would read a dead
+        // endpoint id (the app generates a fresh TransportIdentity every
+        // launch, so the old id can never be reached again regardless).
+        let _ = std::fs::remove_file(&endpoint_addr_file);
+
         // The per-actor environment goes on `tauri-driver`, NOT on the app --
         // see this module's doc comment for why that is the only thing that
         // works.
