@@ -26,7 +26,7 @@ struct LiveSpecState {
     history: VecDeque<(u64, Value)>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PatchResponse {
     Unchanged { version: u64 },

@@ -13,6 +13,7 @@ use space_chat_transport::transport::TransportEvent;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -285,22 +286,21 @@ fn append_new_listing_entries(listing: &mut RedbListingIndex, space_id: &str, ep
 /// The background network-event pipeline: the "third consumer of the
 /// storage spec's `Projection` change feed," driven by real network events.
 ///
-/// IMPORTANT -- SCOPED DELIBERATELY NARROW FOR THIS TASK: this handles
-/// `IncomingChange` by persisting the already-mutated-in-place shared
+/// Handles `IncomingChange` by persisting the already-mutated-in-place shared
 /// segment, advancing `listing_index`'s watermark via `replay::catch_up`,
-/// and populating any not-yet-indexed message keys via
+/// populating any not-yet-indexed message keys via
 /// `append_new_listing_entries` (see its doc comment for a real, disclosed
-/// ordering limitation). It does NOT regenerate an actively-viewed
-/// conversation's spec or push a patch event yet -- that needs
-/// `regenerate_spec_value`/`crate::events`, which are introduced in the NEXT
-/// task. Whoever implements that task must extend this same function (not
-/// build a second, competing event loop) to add: "if `state.active` has an
-/// entry for `change.space_id`, regenerate its spec value, call
-/// `live_spec.update(..)`, and emit a `ConversationPatchEvent`."
+/// ordering limitation), and -- if `state.active` has an entry for
+/// `change.space_id` (i.e. someone is actively viewing this conversation
+/// right now) -- regenerating that conversation's spec value via
+/// `crate::commands::regenerate_spec_value`, feeding it into the existing
+/// `LiveSpec::update`, and emitting a `ConversationPatchEvent` on this
+/// space's per-conversation event name so the frontend can apply the patch
+/// live.
 fn spawn_network_event_loop<R: tauri::Runtime>(
     state: Arc<AppState>,
     mut events: mpsc::UnboundedReceiver<TransportEvent>,
-    _app_handle: tauri::AppHandle<R>,
+    app_handle: tauri::AppHandle<R>,
 ) {
     // NOT `tokio::spawn`: `AppState::new` (this function's only caller) runs
     // synchronously, outside of any `tauri::async_runtime::block_on(..)`
@@ -346,6 +346,30 @@ fn spawn_network_event_loop<R: tauri::Runtime>(
                             append_new_listing_entries(&mut listing, &change.space_id, change.epoch, &message_keys);
                         }
                     }
+
+                    // `regenerate_spec_value` takes its own locks on
+                    // `listing_index`/`segment_store` -- the locks acquired
+                    // above must already be dropped (they are, by end of the
+                    // `if let Ok(mut store) = ...` block) before calling it,
+                    // or this would deadlock re-locking the same
+                    // `std::sync::Mutex` on this thread.
+                    let active = state.active.lock().unwrap();
+                    if let Some(conversation) = active.get(&change.space_id) {
+                        // Title is not persisted anywhere yet in this plan's
+                        // scope -- reuse space_id as a readable fallback
+                        // title, matching the same pattern a later task's
+                        // local-mutation path uses for the same reason.
+                        let new_value =
+                            crate::commands::regenerate_spec_value(&state, &change.space_id, &change.space_id);
+                        conversation.live_spec.update(new_value);
+                        let (version, _) = conversation.live_spec.snapshot();
+                        let patch = conversation.live_spec.diff_since(version.saturating_sub(1));
+                        let event =
+                            crate::events::ConversationPatchEvent { space_id: change.space_id.clone(), patch };
+                        let _ =
+                            app_handle.emit(&crate::events::conversation_patch_event_name(&change.space_id), event);
+                    }
+                    drop(active);
                 }
                 TransportEvent::Connected { .. } | TransportEvent::Disconnected { .. } => {
                     // Handled by AppNetwork's own status watch channel; nothing to do here.
@@ -570,5 +594,77 @@ mod tests {
         append_new_listing_entries(&mut state.listing_index.lock().unwrap(), "space-1", 0, &message_keys);
         let page = state.listing_index.lock().unwrap().page("space-1", None, 10).unwrap();
         assert_eq!(page.len(), 1, "re-running the event-loop's persistence steps must not duplicate the listing entry");
+    }
+
+    /// Exercises the real `spawn_network_event_loop` (not just its building
+    /// blocks, per the test above) end-to-end for the "regenerate spec, call
+    /// `live_spec.update`, emit a patch" step this task adds: opens a
+    /// conversation (so `state.active` has an entry for it, exactly as the
+    /// production `open_conversation` command would leave it), mutates the
+    /// shared segment the same way a real incoming sync would, then drives a
+    /// genuine `TransportEvent::IncomingChange` through a fresh channel
+    /// wired to a second `spawn_network_event_loop` instance (a test-only
+    /// duplicate consumer -- production only ever spawns one, via
+    /// `AppState::new`) and asserts the actively-viewed conversation's
+    /// `LiveSpec` version advances and its new spec reflects the synced
+    /// message.
+    #[tokio::test]
+    async fn incoming_change_advances_an_actively_viewed_conversations_live_spec_version() {
+        use space_chat_core::projection::SegmentChange;
+        use space_chat_transport::transport::TransportEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (network, events) = inert_network().await;
+        let state = AppState::new(dir.path(), DeviceId([1u8; 32]), network, events, mock_app_handle()).unwrap();
+
+        crate::commands::open_conversation_impl(&state, "space-1", "General", 10_000).await;
+        let (initial_version, _) = {
+            let active = state.active.lock().unwrap();
+            active.get("space-1").unwrap().live_spec.snapshot()
+        };
+        assert_eq!(initial_version, 0);
+
+        // Mutate the shared, Transport-registered segment directly, as a
+        // real incoming sync would before emitting IncomingChange.
+        let arc = state.segment_arc("space-1").await;
+        {
+            let mut seg = arc.lock().await;
+            seg.append_message(&Message {
+                sender: DeviceId([1u8; 32]),
+                content: "from the network".to_string(),
+                attachments: vec![],
+            });
+        }
+        let change = { arc.lock().await.latest_change() };
+
+        let (tx, rx) = mpsc::unbounded_channel::<TransportEvent>();
+        spawn_network_event_loop(state.clone(), rx, mock_app_handle());
+        tx.send(TransportEvent::IncomingChange(SegmentChange {
+            space_id: "space-1".to_string(),
+            epoch: 0,
+            cursor: change.cursor,
+            bytes: change.bytes,
+        }))
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (version, _) = {
+                let active = state.active.lock().unwrap();
+                active.get("space-1").unwrap().live_spec.snapshot()
+            };
+            if version >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for the network event loop to push a patch");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let (version, spec) = {
+            let active = state.active.lock().unwrap();
+            active.get("space-1").unwrap().live_spec.snapshot()
+        };
+        assert_eq!(version, 1, "LiveSpec version should advance exactly once for the one incoming change");
+        assert_eq!(spec["messages"][0]["content"], "from the network");
     }
 }

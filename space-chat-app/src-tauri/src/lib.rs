@@ -1,4 +1,6 @@
+pub mod commands;
 pub mod conversation_spec;
+pub mod events;
 pub mod live_spec;
 pub mod membership;
 pub mod network;
@@ -43,7 +45,12 @@ pub fn run() {
             app.manage(app_state);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            commands::open_conversation,
+            commands::close_conversation,
+            commands::resync_conversation
+        ])
         .run(tauri::generate_context!())
         .expect("error while running space-chat-app");
 }
