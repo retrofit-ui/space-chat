@@ -169,6 +169,13 @@ mod tests {
         assert_eq!(unhex(""), None, "empty input must not decode");
         assert_eq!(unhex(&"ab".repeat(20)), None, "too short must not decode");
         assert_eq!(unhex(&"zz".repeat(32)), None, "non-hex content must not decode");
-        assert_eq!(unhex(&"é".repeat(32)), None, "non-ASCII content must error, not panic");
+        // NOT `"é".repeat(32)` -- see `lib.rs`'s `decode_endpoint_id_hex`
+        // regression test comment for why that specific 64-byte input
+        // doesn't actually reproduce the panic (its char boundaries happen
+        // to align with the slicing offsets). This input's leading 1-byte
+        // char shifts every "é" onto an odd byte offset, which does not.
+        let odd_boundary_64_bytes = format!("a{}b", "é".repeat(31));
+        assert_eq!(odd_boundary_64_bytes.len(), 64, "test input must stay exactly 64 bytes");
+        assert_eq!(unhex(&odd_boundary_64_bytes), None, "non-ASCII content must error, not panic");
     }
 }

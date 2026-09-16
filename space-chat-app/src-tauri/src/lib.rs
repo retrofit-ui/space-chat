@@ -563,7 +563,21 @@ mod tests {
         // 64 *bytes* but fewer than 64 chars would slice mid-char without
         // `str::get`; this must return None, not panic. Mirrors
         // `decode_hash_hex`'s own non-ASCII regression test.
-        assert_eq!(decode_endpoint_id_hex(&"é".repeat(32)), None);
+        //
+        // NOT `"é".repeat(32)`: review found that input doesn't actually
+        // reproduce the panic this test exists to guard against. "é" is 2
+        // bytes, so `"é".repeat(32)` is 64 bytes whose char boundaries land
+        // on every EVEN byte offset -- exactly the offsets `i*2..i*2+2`
+        // slices at, so the old direct-slicing code never split a
+        // character on that input; it just returned early via
+        // `from_str_radix`'s `Err`. Verified by compiling the pre-fix loop
+        // shape directly: `"é".repeat(32)` didn't panic against it, but
+        // `format!("a{}b", "é".repeat(31))` (also 64 bytes, but with a
+        // leading 1-byte char shifting every "é" onto an ODD byte offset)
+        // did.
+        let odd_boundary_64_bytes = format!("a{}b", "é".repeat(31));
+        assert_eq!(odd_boundary_64_bytes.len(), 64, "test input must stay exactly 64 bytes");
+        assert_eq!(decode_endpoint_id_hex(&odd_boundary_64_bytes), None);
     }
 
     /// Proves the dial address a peer reconstructs really does carry the relay
@@ -715,8 +729,15 @@ mod tests {
         assert!(decode_hash_hex(&"42".repeat(33)).is_err(), "too long");
         assert!(decode_hash_hex(&"zz".repeat(32)).is_err(), "not hex");
         // 64 *bytes* but fewer than 64 chars would slice mid-char without
-        // `str::get`; this must error, not panic.
-        assert!(decode_hash_hex(&"é".repeat(32)).is_err());
+        // `str::get`; this must error, not panic. NOT `"é".repeat(32)` --
+        // see `decode_endpoint_id_hex_rejects_partial_or_malformed_content`'s
+        // comment for why that specific input doesn't actually reproduce
+        // the panic (its char boundaries happen to align with the slicing
+        // offsets). This input's leading 1-byte char shifts every "é" onto
+        // an odd byte offset, which does not align.
+        let odd_boundary_64_bytes = format!("a{}b", "é".repeat(31));
+        assert_eq!(odd_boundary_64_bytes.len(), 64, "test input must stay exactly 64 bytes");
+        assert!(decode_hash_hex(&odd_boundary_64_bytes).is_err());
     }
 
     /// End-to-end proof of everything `run()`'s `.setup()` closure now does
