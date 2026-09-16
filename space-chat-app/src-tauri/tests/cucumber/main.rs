@@ -25,8 +25,15 @@ async fn main() {
     // `wait_for_port` succeeding against a DIFFERENT scenario's already-
     // listening driver, connecting to an actor with the wrong environment).
     // Capped to 1 to make scenarios run sequentially instead.
+    // `.run_and_exit`, NOT `.run`: `World::run()`'s own default impl is
+    // `Self::cucumber().run_and_exit(input)` -- `run_and_exit` panics if
+    // `writer.execution_has_failed()`, which is what makes a failed step,
+    // scenario, or feature-parse error actually fail `cargo test`. Plain
+    // `.run(..)` returns the writer and does that check NOT AT ALL --
+    // silently exiting 0 regardless of outcome. Confirmed by reading both
+    // methods directly in the installed cucumber-0.23.0 source.
     world::SpaceChatWorld::cucumber()
         .max_concurrent_scenarios(1)
-        .run("tests/cucumber/features")
+        .run_and_exit("tests/cucumber/features")
         .await;
 }
