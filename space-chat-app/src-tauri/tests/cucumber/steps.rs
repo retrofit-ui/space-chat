@@ -15,6 +15,10 @@ use std::time::Duration;
 const MESSAGE_INPUT: &str = "[data-testid=message-input]";
 const SEND_BUTTON: &str = "[data-testid=send-button]";
 
+/// `AttachmentImage.tsx`'s two mutually-exclusive states.
+const ATTACHMENT_PLACEHOLDER: &str = "[data-testid=attachment-placeholder]";
+const ATTACHMENT_LOADED: &str = "[data-testid=attachment-loaded]";
+
 /// Brings `name` online: a real relay-connected `space-chat-app` process in
 /// its own data directory, driven through its own WebDriver session.
 #[given(regex = r"^(\w+) is a device in the space, online$")]
@@ -123,6 +127,110 @@ async fn then_conversation_view_shows(world: &mut SpaceChatWorld, name: String, 
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Sends a message carrying one attachment whose bytes were deliberately never
+/// saved to the local blob store -- the cache-miss case Task 13's protocol
+/// handler answers with placeholder bytes. The hash the app reports back is
+/// remembered on the `World` so the later `When` step can name the exact same
+/// attachment; cucumber step functions cannot return values to one another.
+///
+/// Goes through a real Tauri command rather than the UI because there is no
+/// attachment picker in the app yet (an acknowledged gap in this plan) -- but
+/// `send_message_with_missing_attachment_for_testing` reaches the message
+/// through `send_message_with_attachments_impl`, the very same
+/// persist/notify/patch path `send_message` itself uses, so everything after
+/// the send (spec regeneration, patch emission, rendering) is the real thing.
+#[given(regex = r"^(\w+) has sent a message with an attachment not yet present in her attachment store$")]
+async fn given_message_with_missing_attachment(world: &mut SpaceChatWorld, name: String) {
+    const SCRIPT: &str = r#"
+        const [callback] = arguments;
+        window.__TAURI__.core.invoke("send_message_with_missing_attachment_for_testing")
+            .then((hash) => callback(hash))
+            .catch((err) => callback("ERROR:" + String(err)));
+    "#;
+    let client = world.client(&name);
+    wait_for_app_ready(client, &name).await;
+    let result = client
+        .execute_async(SCRIPT, vec![])
+        .await
+        .unwrap_or_else(|e| panic!("WebDriver could not run the attachment-send script for {name:?}: {e}"));
+    let hash = result
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a hex hash string back for {name:?}, got: {result:?}"))
+        .to_string();
+    assert!(
+        !hash.starts_with("ERROR:"),
+        "send_message_with_missing_attachment_for_testing failed for {name:?} \
+         (SPACECHAT_TEST_HOOKS is set by spawn_actor); got: {hash}"
+    );
+    world.remember_attachment_hash(&name, hash);
+}
+
+/// The cache-miss half of the assertion: `AttachmentImage` starts in its
+/// placeholder state and stays there until an `attachment-ready` event arrives,
+/// so seeing this element proves the message rendered AND that the bytes are
+/// (correctly) not yet considered available.
+#[then(regex = r"^(\w+)'s conversation view shows an attachment placeholder$")]
+async fn then_shows_attachment_placeholder(world: &mut SpaceChatWorld, name: String) {
+    let client = world.client(&name);
+    client
+        .wait()
+        .at_most(Duration::from_secs(10))
+        .for_element(Locator::Css(ATTACHMENT_PLACEHOLDER))
+        .await
+        .unwrap_or_else(|e| panic!("expected an attachment placeholder in {name:?}'s conversation view: {e}"));
+}
+
+/// Stands in for the fetch-over-network pipeline that doesn't exist yet: the
+/// bytes land in the real local `AttachmentBlobStore` and the real
+/// `attachment-ready:<hash>` event fires, which is all the frontend ever
+/// observes of a completed fetch.
+#[when(regex = r"^the attachment bytes become available in (\w+)'s attachment store$")]
+async fn when_attachment_becomes_available(world: &mut SpaceChatWorld, name: String) {
+    const SCRIPT: &str = r#"
+        const [hashHex, callback] = arguments;
+        window.__TAURI__.core.invoke("simulate_attachment_arrival_for_testing", { hashHex })
+            .then(() => callback(null))
+            .catch((err) => callback(String(err)));
+    "#;
+    let hash = world.attachment_hash(&name);
+    let client = world.client(&name);
+    let result = client
+        .execute_async(SCRIPT, vec![serde_json::json!(hash)])
+        .await
+        .unwrap_or_else(|e| panic!("WebDriver could not run the attachment-arrival script for {name:?}: {e}"));
+    assert!(
+        result.is_null(),
+        "simulate_attachment_arrival_for_testing failed for {name:?} (hash {hash}); got: {result:?}"
+    );
+}
+
+/// The transition itself: the placeholder must be gone and the real `<img>`
+/// present. Asserting the placeholder's *disappearance* too (not just the
+/// image's appearance) is what makes this a transition rather than two
+/// unrelated elements coexisting.
+#[then(regex = r"^(\w+)'s conversation view shows the loaded attachment within (\d+) seconds$")]
+async fn then_shows_loaded_attachment(world: &mut SpaceChatWorld, name: String, seconds: u64) {
+    let client = world.client(&name);
+    client
+        .wait()
+        .at_most(Duration::from_secs(seconds))
+        .for_element(Locator::Css(ATTACHMENT_LOADED))
+        .await
+        .unwrap_or_else(|e| {
+            panic!("expected {name:?}'s conversation view to show a loaded attachment within {seconds}s: {e}")
+        });
+    let leftover = client
+        .find_all(Locator::Css(ATTACHMENT_PLACEHOLDER))
+        .await
+        .unwrap_or_else(|e| panic!("could not re-check {name:?}'s placeholders: {e}"));
+    assert!(
+        leftover.is_empty(),
+        "{name}'s attachment placeholder should be gone once the real image rendered, \
+         but {} placeholder element(s) remain",
+        leftover.len()
+    );
 }
 
 /// Waits until an actor's frontend bundle has actually rendered a

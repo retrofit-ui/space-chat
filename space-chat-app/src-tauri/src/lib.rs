@@ -57,6 +57,104 @@ fn seed_membership_impl(state: &state::AppState, space_id: &str, peer_names: &[S
     Ok(())
 }
 
+/// The fixed attachment hash `send_message_with_missing_attachment_for_testing`
+/// uses. Fixed rather than random: it is the ONE hash that scenario ever asks
+/// about, so a constant keeps the test deterministic and trivially greppable in
+/// a log. It is not the hash of anything, which is the point -- nothing ever
+/// calls `save_attachment` with it until the scenario explicitly says the bytes
+/// "arrived."
+const MISSING_ATTACHMENT_HASH: [u8; 32] = [0x42u8; 32];
+
+/// Sends a message in `DEFAULT_SPACE_ID` carrying one attachment whose hash is
+/// deliberately never passed to `AttachmentBlobStore::save_attachment` --
+/// exactly the cache-miss case Task 13's `handle_attachment_request` exists to
+/// handle, and therefore exactly what makes `AttachmentImage` render its
+/// placeholder rather than a loaded image.
+///
+/// Returns the hex-encoded hash so the caller (a test step) can later hand the
+/// same value to `simulate_attachment_arrival_for_testing`. Runtime-gated
+/// behind `SPACECHAT_TEST_HOOKS`, same as `seed_membership_for_testing`.
+///
+/// Emits the conversation patch itself (via `commands::emit_patch_if_active`)
+/// for the same reason `commands::send_message` does: `mutate_and_persist`
+/// advances the active conversation's `LiveSpec` but does not emit, so without
+/// this the frontend would never learn a message had been appended.
+#[tauri::command]
+async fn send_message_with_missing_attachment_for_testing(
+    state: tauri::State<'_, std::sync::Arc<state::AppState>>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    if std::env::var("SPACECHAT_TEST_HOOKS").is_err() {
+        return Err(
+            "send_message_with_missing_attachment_for_testing is only available when SPACECHAT_TEST_HOOKS is set"
+                .to_string(),
+        );
+    }
+    let hash = MISSING_ATTACHMENT_HASH;
+    commands::send_message_with_attachments_impl(
+        &state,
+        DEFAULT_SPACE_ID,
+        "here's an attachment".to_string(),
+        vec![space_chat_core::domain::AttachmentRef {
+            hash,
+            size: 12,
+            mime: "image/png".to_string(),
+            wrapped_key: vec![],
+        }],
+    )
+    .await?;
+    commands::emit_patch_if_active(&app, &state, DEFAULT_SPACE_ID);
+    Ok(hex_encode(&hash))
+}
+
+/// Writes fake bytes into the local `AttachmentBlobStore` for `hash_hex` (as if
+/// a real fetch-over-network had just completed) and emits the same
+/// `attachment-ready:<hash>` event Task 13's real (not-yet-built) fetch
+/// pipeline would eventually emit. `AttachmentImage` (Task 16) doesn't care how
+/// the bytes arrived, only that the event fires once they have -- so this is a
+/// faithful stand-in for the *frontend's* half of lazy fetch even though the
+/// transport half doesn't exist yet.
+#[tauri::command]
+async fn simulate_attachment_arrival_for_testing(
+    state: tauri::State<'_, std::sync::Arc<state::AppState>>,
+    app: tauri::AppHandle,
+    hash_hex: String,
+) -> Result<(), String> {
+    if std::env::var("SPACECHAT_TEST_HOOKS").is_err() {
+        return Err(
+            "simulate_attachment_arrival_for_testing is only available when SPACECHAT_TEST_HOOKS is set".to_string()
+        );
+    }
+    let hash = decode_hash_hex(&hash_hex)?;
+    {
+        use space_chat_core::storage::AttachmentBlobStore;
+        let mut store = state.attachment_store.lock().map_err(|e| e.to_string())?;
+        store.save_attachment(&hash, b"fake image bytes for testing").map_err(|e| e.to_string())?;
+    }
+    use tauri::Emitter;
+    let _ = app.emit(&events::attachment_ready_event_name(&hash_hex), ());
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decodes exactly 64 hex characters into a 32-byte hash. Uses `str::get`
+/// rather than direct slicing so a non-ASCII input returns an error instead of
+/// panicking on a char-boundary split.
+fn decode_hash_hex(hash_hex: &str) -> Result<[u8; 32], String> {
+    if hash_hex.len() != 64 {
+        return Err(format!("hash_hex must be 64 hex characters, got {}", hash_hex.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let pair = hash_hex.get(i * 2..i * 2 + 2).ok_or_else(|| "hash_hex is not ASCII hex".to_string())?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|e| format!("hash_hex is not valid hex: {e}"))?;
+    }
+    Ok(out)
+}
+
 /// The one space this app opens. Must stay in lockstep with `App.tsx`'s own
 /// `DEFAULT_SPACE_ID` constant: the frontend opens exactly this space on
 /// launch and offers no way to open another, and `run()` below pre-registers
@@ -144,6 +242,8 @@ pub fn run() {
             commands::generate_invite,
             commands::join_via_invite,
             seed_membership_for_testing,
+            send_message_with_missing_attachment_for_testing,
+            simulate_attachment_arrival_for_testing,
         ])
         .run(tauri::generate_context!())
         .expect("error while running space-chat-app");
@@ -467,6 +567,37 @@ mod tests {
             );
         }
         assert_eq!(state.membership.lock().unwrap().display_name(&deterministic_device_id_for_actor("bob")), "bob");
+    }
+
+    /// The round trip that matters for the attachment lazy-fetch scenario:
+    /// `send_message_with_missing_attachment_for_testing` returns
+    /// `hex_encode(MISSING_ATTACHMENT_HASH)`, and the value the test step hands
+    /// back to `simulate_attachment_arrival_for_testing` must decode to the
+    /// same 32 bytes -- otherwise the bytes would be saved under a hash the
+    /// rendered `<img>`'s URL never asks about, and the scenario would hang on
+    /// a placeholder that never resolves.
+    #[test]
+    fn the_missing_attachment_hash_round_trips_through_hex() {
+        let encoded = hex_encode(&MISSING_ATTACHMENT_HASH);
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(decode_hash_hex(&encoded).unwrap(), MISSING_ATTACHMENT_HASH);
+        // The same hex the frontend's `spacechat://attachment/<hash>` URL
+        // carries, which `parse_attachment_hash` must agree on.
+        assert_eq!(
+            crate::attachment_protocol::parse_attachment_hash(&format!("/{encoded}")),
+            Some(MISSING_ATTACHMENT_HASH)
+        );
+    }
+
+    #[test]
+    fn decode_hash_hex_rejects_wrong_length_and_non_hex_input() {
+        assert!(decode_hash_hex("").is_err());
+        assert!(decode_hash_hex(&"42".repeat(31)).is_err(), "too short");
+        assert!(decode_hash_hex(&"42".repeat(33)).is_err(), "too long");
+        assert!(decode_hash_hex(&"zz".repeat(32)).is_err(), "not hex");
+        // 64 *bytes* but fewer than 64 chars would slice mid-char without
+        // `str::get`; this must error, not panic.
+        assert!(decode_hash_hex(&"é".repeat(32)).is_err());
     }
 
     /// End-to-end proof of everything `run()`'s `.setup()` closure now does

@@ -137,7 +137,7 @@ pub async fn resync_conversation(
     resync_conversation_impl(&state, &space_id, since_version).await
 }
 
-use space_chat_core::domain::{Delete, Message, Reaction};
+use space_chat_core::domain::{AttachmentRef, Delete, Message, Reaction};
 use space_chat_core::segment::{objid_to_target_string, Segment};
 use space_chat_core::storage::{ListingEntry, ListingIndex, SegmentBlobStore};
 
@@ -206,12 +206,32 @@ async fn mutate_and_persist(
 }
 
 pub async fn send_message_impl(state: &AppState, space_id: &str, content: String) -> Result<(), String> {
+    send_message_with_attachments_impl(state, space_id, content, vec![]).await
+}
+
+/// Same as `send_message_impl`, but lets the caller attach real
+/// `AttachmentRef`s. `send_message_impl` itself is just this with an empty
+/// attachment list -- there is no separate code path to keep in sync.
+///
+/// Reachable today only from `send_message_impl` and the test-only
+/// `send_message_with_missing_attachment_for_testing` (`lib.rs`): a real
+/// `send_attachment`/attachment-picker command (which would need to hash,
+/// encrypt and persist the bytes before it could build an `AttachmentRef`)
+/// is out of this plan's scope. This at least means the day one exists, it
+/// has a real function to call rather than needing its own from-scratch
+/// persist/notify/patch logic.
+pub async fn send_message_with_attachments_impl(
+    state: &AppState,
+    space_id: &str,
+    content: String,
+    attachments: Vec<AttachmentRef>,
+) -> Result<(), String> {
     let local_device = state.local_device;
     mutate_and_persist(state, space_id, move |segment| {
         let new_obj_id = segment.append_message(&Message {
             sender: local_device,
             content,
-            attachments: vec![],
+            attachments,
         });
         // NOT `segment.message_keys().last()`: `message_keys()`'s own doc
         // comment states it iterates "in no particular order" (Automerge
@@ -393,7 +413,7 @@ pub async fn fetch_older_page(
 /// command wrappers were left untested at the IPC layer -- only their
 /// `_impl` functions have unit tests). If a later task adds IPC-level tests
 /// for these commands, revisit whether this needs to become generic too.
-fn emit_patch_if_active(app: &tauri::AppHandle, state: &AppState, space_id: &str) {
+pub(crate) fn emit_patch_if_active(app: &tauri::AppHandle, state: &AppState, space_id: &str) {
     use tauri::Emitter;
 
     let active = state.active.lock().unwrap();

@@ -115,6 +115,14 @@ pub struct SpaceChatWorld {
     /// downcast.
     pub relay_server: Option<Box<dyn std::any::Any + Send>>,
     pub actors: HashMap<String, Actor>,
+    /// Per-actor scratch space for the hex attachment hash a `Given` step
+    /// learned and a later `When` step needs. Keyed by actor name for the same
+    /// reason `actors` is: steps only ever name an actor, never hold a handle
+    /// to one. Kept off `Actor` itself because it is test-script bookkeeping,
+    /// not part of what it means for an actor to be running -- it must survive
+    /// `kill_actor`/`relaunch_actor` untouched. Cucumber builds a fresh
+    /// `World` per scenario, so there is nothing to reset between scenarios.
+    attachment_hashes: HashMap<String, String>,
     next_webdriver_port: u16,
 }
 
@@ -133,6 +141,7 @@ impl SpaceChatWorld {
             relay_url: None,
             relay_server: None,
             actors: HashMap::new(),
+            attachment_hashes: HashMap::new(),
             next_webdriver_port: FIRST_WEBDRIVER_PORT,
         }
     }
@@ -318,6 +327,25 @@ impl SpaceChatWorld {
     /// Convenience for steps: the WebDriver client for a named actor.
     pub fn client(&self, name: &str) -> &Client {
         self.actor(name).client()
+    }
+
+    /// Records the hex attachment hash `name`'s app just reported, for a later
+    /// step to look up. Overwrites any previous value for the same actor:
+    /// only the most recent attachment is ever the one a scenario is talking
+    /// about.
+    pub fn remember_attachment_hash(&mut self, name: &str, hash: String) {
+        self.attachment_hashes.insert(name.to_string(), hash);
+    }
+
+    /// The hash remembered by `remember_attachment_hash`, panicking (rather
+    /// than returning an empty string that would later fail as a confusing
+    /// "not 64 hex characters" error inside the app) if a scenario asks for an
+    /// attachment it never created.
+    pub fn attachment_hash(&self, name: &str) -> String {
+        self.attachment_hashes
+            .get(name)
+            .unwrap_or_else(|| panic!("no attachment hash recorded for actor {name:?} in this scenario"))
+            .clone()
     }
 }
 
