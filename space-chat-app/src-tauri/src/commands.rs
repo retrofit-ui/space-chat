@@ -1,6 +1,6 @@
 use crate::conversation_spec::build_conversation_spec;
 use crate::live_spec::{LiveSpec, PatchResponse};
-use crate::spec::{ConversationErrorSpec, ViewSpec};
+use crate::spec::{ConversationErrorSpec, MessageSpec, ViewSpec};
 use crate::state::{ActiveConversation, AppState};
 use serde::Serialize;
 
@@ -296,6 +296,72 @@ pub async fn delete_message(
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+pub struct OlderPageResult {
+    pub messages: Vec<MessageSpec>,
+    pub has_more_older: bool,
+}
+
+pub async fn fetch_older_page_impl(
+    state: &AppState,
+    space_id: &str,
+    before_epoch: u64,
+    before_seq: u64,
+    limit: usize,
+) -> Result<OlderPageResult, String> {
+    use space_chat_core::storage::ListingIndex;
+
+    let before = if before_epoch == u64::MAX && before_seq == u64::MAX {
+        None
+    } else {
+        Some((before_epoch, before_seq))
+    };
+
+    let page = state
+        .listing_index
+        .lock()
+        .unwrap()
+        .page(space_id, before, limit)
+        .map_err(|e| e.to_string())?;
+
+    // Reuses this file's `compute_has_more_older` (Task 9) so the live/initial
+    // spec and this pagination path can never disagree about what "more
+    // older" means for the same underlying listing state.
+    let has_more_older = compute_has_more_older(state, space_id, &page);
+
+    let segments = state.segments_for(space_id);
+    let membership = state.membership.lock().unwrap();
+    let mut observed_at = state.observed_at.lock().unwrap();
+
+    let spec = build_conversation_spec(
+        space_id,
+        space_id, // title is discarded below -- see this brief's note on why that's fine here
+        &page,
+        &segments,
+        &*membership,
+        &mut *observed_at,
+        has_more_older,
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(OlderPageResult { messages: spec.messages, has_more_older })
+}
+
+#[tauri::command]
+pub async fn fetch_older_page(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+    space_id: String,
+    before_epoch: u64,
+    before_seq: u64,
+    limit: usize,
+) -> Result<OlderPageResult, String> {
+    fetch_older_page_impl(&state, &space_id, before_epoch, before_seq, limit).await
+}
+
 /// Looks up the current patch for `space_id` (if it's actively viewed) and
 /// emits it on `crate::events::conversation_patch_event_name`. Takes a bare
 /// (non-generic) `tauri::AppHandle` -- unlike `state.rs`'s network event
@@ -536,5 +602,32 @@ mod tests {
         let active = state.active.lock().unwrap();
         let (_, spec_value) = active.get("space-1").unwrap().live_spec.snapshot();
         assert_eq!(spec_value["title"], "General", "title must not fall back to space_id after a local mutation");
+    }
+
+    #[tokio::test]
+    async fn fetch_older_page_returns_messages_strictly_before_the_given_cursor() {
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+        for content in ["one", "two", "three"] {
+            send_message_impl(&state, "space-1", content.to_string()).await.unwrap();
+        }
+
+        // Page 1: newest 2.
+        let page1 = fetch_older_page_impl(&state, "space-1", u64::MAX, u64::MAX, 2).await.unwrap();
+        assert_eq!(page1.messages.len(), 2);
+        assert_eq!(page1.messages[0].content, "two");
+        assert_eq!(page1.messages[1].content, "three");
+        assert!(page1.has_more_older);
+    }
+
+    #[tokio::test]
+    async fn fetch_older_page_reports_no_more_older_once_exhausted() {
+        let (_dir, state) = fresh_state().await;
+        state.membership.lock().unwrap().create_space("space-1", DeviceId([1u8; 32]), "Alice".to_string());
+        send_message_impl(&state, "space-1", "only one".to_string()).await.unwrap();
+
+        let page = fetch_older_page_impl(&state, "space-1", u64::MAX, u64::MAX, 10).await.unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert!(!page.has_more_older);
     }
 }

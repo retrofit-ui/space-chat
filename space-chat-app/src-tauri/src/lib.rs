@@ -53,6 +53,7 @@ pub fn run() {
             commands::send_message,
             commands::react,
             commands::delete_message,
+            commands::fetch_older_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running space-chat-app");
