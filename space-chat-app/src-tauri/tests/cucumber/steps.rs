@@ -6,17 +6,12 @@
 use crate::world::SpaceChatWorld;
 use cucumber::{given, then, when};
 use fantoccini::{Client, Locator};
+use space_chat_app_lib::DEFAULT_SPACE_ID;
 use std::time::Duration;
 
-/// The space `App.tsx` always opens on launch (Task 16's hardcoded
-/// `DEFAULT_SPACE_ID`) -- there is no mechanism for a scenario to make a
-/// running actor open any other space, so every scenario in this harness that
-/// needs a "shared space" must use exactly this id.
-const DEFAULT_SPACE_ID: &str = "space-default";
-
-/// CSS selector for the composer input `App.tsx` renders unconditionally.
-/// Also this harness's "the frontend bundle has actually run" signal -- see
-/// `wait_for_app_ready`.
+/// CSS selector for the composer input `App.tsx` renders unconditionally
+/// (before a conversation is even loaded -- see `wait_for_app_ready`'s doc
+/// comment for why that makes it the wrong readiness gate).
 const MESSAGE_INPUT: &str = "[data-testid=message-input]";
 const SEND_BUTTON: &str = "[data-testid=send-button]";
 
@@ -130,23 +125,41 @@ async fn then_conversation_view_shows(world: &mut SpaceChatWorld, name: String, 
     }
 }
 
-/// Waits until an actor's frontend bundle has actually rendered. A WebDriver
-/// session is created the moment the app process starts, which is well before
-/// the webview has loaded the page -- so without this, the first `find` in a
-/// step can race the page load and fail with "no such element" against an app
-/// that is perfectly healthy.
+/// Waits until an actor's frontend bundle has actually rendered a
+/// conversation -- not just its composer, which `App.tsx` renders
+/// unconditionally before its `onMount`'s `openConversation(...)` call has
+/// resolved. Gating on the composer alone would let a step proceed before
+/// `state.active` is populated on the backend, which could make
+/// `seed_membership`/`send_message` land in a narrow window where a sent
+/// message's patch is never pushed (no active conversation to push it to
+/// yet) -- gating on `.conversation-view` (only rendered once `spec()` is
+/// set) closes that window.
+///
+/// A WebDriver session is created the moment the app process starts, which
+/// is well before the webview has loaded the page at all -- so without this
+/// wait, the very first `find` in a step can race the page load and fail
+/// with "no such element" against an app that is perfectly healthy.
 async fn wait_for_app_ready(client: &Client, actor_name: &str) {
     let Err(e) =
-        client.wait().at_most(Duration::from_secs(30)).for_element(Locator::Css(MESSAGE_INPUT)).await
+        client.wait().at_most(Duration::from_secs(30)).for_element(Locator::Css(".conversation-view")).await
     else {
         return;
     };
     // Whatever the webview *did* load is the only useful evidence here, so
-    // report it rather than just "timed out".
+    // report it rather than just "timed out". Truncate by char, not byte --
+    // the page can contain non-ASCII text (e.g. the composer's placeholder
+    // has a U+2026 ellipsis), and `String::truncate` panics if the byte
+    // index it's given isn't on a char boundary, which would mask the real
+    // failure behind an unrelated panic.
     let url = client.current_url().await.map(|u| u.to_string()).unwrap_or_else(|e| format!("<unavailable: {e}>"));
-    let mut source = client.source().await.unwrap_or_else(|e| format!("<unavailable: {e}>"));
-    source.truncate(2000);
+    let source: String = client
+        .source()
+        .await
+        .unwrap_or_else(|e| format!("<unavailable: {e}>"))
+        .chars()
+        .take(2000)
+        .collect();
     panic!(
-        "actor {actor_name:?}'s frontend never rendered its composer: {e}\n  url: {url}\n  source: {source}"
+        "actor {actor_name:?}'s frontend never rendered a conversation view: {e}\n  url: {url}\n  source: {source}"
     );
 }

@@ -93,15 +93,15 @@ pub fn run() {
                     .expect("failed to bind AppNetwork");
             let app_state = state::AppState::new(&data_dir, local_device, network, events, app.handle().clone())
                 .expect("failed to initialize AppState");
-            // Register this app's one space with `Transport` BEFORE any
-            // connection can be dialed or accepted. This ordering is load-
-            // bearing, not stylistic: `Transport::add_space`'s own doc
-            // comment states that the control-stream digest exchange runs
-            // exactly once per connection and its remote-digest snapshot is
-            // frozen for that connection's whole lifetime, so "a space added
-            // while a connection already exists will not sync over that
-            // pre-existing connection at all -- not eventually, not on
-            // retry, never."
+            // Register this app's one space with `Transport` BEFORE this
+            // process can DIAL any peer. This ordering is load-bearing, not
+            // stylistic: `Transport::add_space`'s own doc comment states
+            // that the control-stream digest exchange runs exactly once per
+            // connection and its remote-digest snapshot is frozen for that
+            // connection's whole lifetime, so "a space added while a
+            // connection already exists will not sync over that pre-
+            // existing connection at all -- not eventually, not on retry,
+            // never."
             //
             // Until this call existed, the ONLY `add_space` in the app came
             // from `segment_arc`, reached via the `open_conversation` command
@@ -111,6 +111,21 @@ pub fn run() {
             // and no message ever synced. Caught by the golden-path E2E
             // scenario (the local send/render path is unaffected, which is
             // why every prior test passed).
+            //
+            // NOTE this only covers the DIAL side. `Transport::bind` (just
+            // above) starts accepting inbound connections immediately, so
+            // any peer that manages to dial THIS process during the window
+            // between `bind` and this line (all of `AppState::new` --
+            // directory creation, redb setup with several fsyncs, membership
+            // load) would still hit the exact same gap on the accept side.
+            // That window is unreachable today only because nothing can
+            // currently dial this app at all: `TransportIdentity` is
+            // regenerated every launch and never persisted or announced
+            // outside a test harness (see the TODO above). The moment that
+            // gap is closed, this accept-side window becomes live and would
+            // need its own fix (e.g. registering the space before `bind`
+            // even starts accepting, which needs restructuring since
+            // `AppState`/its storage currently come after `bind`).
             tauri::async_runtime::block_on(app_state.segment_arc(DEFAULT_SPACE_ID));
             announce_and_dial_from_env(&app_state.network);
             app.manage(app_state);
