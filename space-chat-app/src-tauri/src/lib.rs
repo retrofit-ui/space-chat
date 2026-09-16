@@ -377,7 +377,11 @@ fn decode_endpoint_id_hex(hex: &str) -> Option<iroh::EndpointId> {
     }
     let mut bytes = [0u8; 32];
     for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+        // `str::get` rather than direct slicing: a non-ASCII input can be 64
+        // *bytes* long while not landing byte-index splits on char
+        // boundaries, which would panic on direct `&hex[..]` slicing.
+        let pair = hex.get(i * 2..i * 2 + 2)?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
     }
     iroh::EndpointId::from_bytes(&bytes).ok()
 }
@@ -446,7 +450,10 @@ fn announce_and_dial_from_env(network: &network::AppNetwork) {
 ///
 /// NOT cryptographically meaningful: same caveat as `rand_byte` below, this is
 /// test-harness scaffolding under the existing placeholder membership model,
-/// not identity material. Only reachable when `SPACECHAT_ACTOR_NAME` is set.
+/// not identity material. Only reachable when both `SPACECHAT_TEST_HOOKS` and
+/// `SPACECHAT_ACTOR_NAME` are set -- gated the same way as every other
+/// test-only hook in this file, so a stray `SPACECHAT_ACTOR_NAME` in a real
+/// user's environment can't silently override their device identity.
 fn deterministic_device_id_for_actor(name: &str) -> space_chat_core::domain::DeviceId {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -462,8 +469,10 @@ fn deterministic_device_id_for_actor(name: &str) -> space_chat_core::domain::Dev
 }
 
 fn load_or_create_local_device_id(data_dir: &std::path::Path) -> space_chat_core::domain::DeviceId {
-    if let Ok(actor_name) = std::env::var("SPACECHAT_ACTOR_NAME") {
-        return deterministic_device_id_for_actor(&actor_name);
+    if std::env::var("SPACECHAT_TEST_HOOKS").is_ok() {
+        if let Ok(actor_name) = std::env::var("SPACECHAT_ACTOR_NAME") {
+            return deterministic_device_id_for_actor(&actor_name);
+        }
     }
     let path = data_dir.join("device_id");
     if let Ok(bytes) = std::fs::read(&path) {
@@ -493,6 +502,17 @@ fn rand_byte() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SPACECHAT_TEST_HOOKS` is now read by both
+    /// `spacechat_actor_name_overrides_the_persisted_device_id` and
+    /// `seed_membership_is_gated_on_test_hooks_and_seeds_deterministic_peer_ids`
+    /// (Fix 2 for the final whole-branch review: `SPACECHAT_ACTOR_NAME` alone
+    /// must no longer override device identity). `std::env::set_var`/
+    /// `remove_var` are process-global, and libtest runs `#[test]`s in
+    /// parallel by default, so both tests must hold this lock for their
+    /// entire read-mutate-read-restore window or they can observe each
+    /// other's env var writes.
+    static TEST_HOOKS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn greet_includes_the_given_name() {
@@ -540,6 +560,10 @@ mod tests {
         assert_eq!(decode_endpoint_id_hex(""), None, "an empty/not-yet-written file must not decode");
         assert_eq!(decode_endpoint_id_hex(&"ab".repeat(20)), None, "a truncated write must not decode");
         assert_eq!(decode_endpoint_id_hex(&"zz".repeat(32)), None, "non-hex content must not decode");
+        // 64 *bytes* but fewer than 64 chars would slice mid-char without
+        // `str::get`; this must return None, not panic. Mirrors
+        // `decode_hash_hex`'s own non-ASCII regression test.
+        assert_eq!(decode_endpoint_id_hex(&"é".repeat(32)), None);
     }
 
     /// Proves the dial address a peer reconstructs really does carry the relay
@@ -575,9 +599,13 @@ mod tests {
     /// The E2E harness relies on `SPACECHAT_ACTOR_NAME` overriding the normal
     /// random-generate-and-persist path entirely -- including when a
     /// `device_id` file already exists, which it will for any relaunched
-    /// actor.
+    /// actor. `SPACECHAT_ACTOR_NAME` alone must NOT be enough, though: the
+    /// harness always sets `SPACECHAT_TEST_HOOKS` alongside it, and without
+    /// that second check a stray `SPACECHAT_ACTOR_NAME` in a real user's
+    /// environment would silently hijack their device identity.
     #[test]
     fn spacechat_actor_name_overrides_the_persisted_device_id() {
+        let _guard = TEST_HOOKS_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("device_id"), [7u8; 32]).unwrap();
 
@@ -588,8 +616,18 @@ mod tests {
         );
 
         std::env::set_var("SPACECHAT_ACTOR_NAME", "alice");
+        std::env::remove_var("SPACECHAT_TEST_HOOKS");
+        let without_hooks = load_or_create_local_device_id(dir.path());
+        assert_eq!(
+            without_hooks,
+            space_chat_core::domain::DeviceId([7u8; 32]),
+            "SPACECHAT_ACTOR_NAME alone, without SPACECHAT_TEST_HOOKS, must NOT override the persisted id"
+        );
+
+        std::env::set_var("SPACECHAT_TEST_HOOKS", "1");
         let id = load_or_create_local_device_id(dir.path());
         std::env::remove_var("SPACECHAT_ACTOR_NAME");
+        std::env::remove_var("SPACECHAT_TEST_HOOKS");
 
         assert_eq!(id, deterministic_device_id_for_actor("alice"));
         assert_ne!(id, space_chat_core::domain::DeviceId([7u8; 32]));
@@ -601,14 +639,17 @@ mod tests {
     /// lets two separate actor processes agree on each other's identity with
     /// no ID exchange at all.
     ///
-    /// Uses `SPACECHAT_TEST_HOOKS`, which no other test in this crate touches,
-    /// so it does not race the env-var wiring test below.
+    /// `spacechat_actor_name_overrides_the_persisted_device_id` above also
+    /// touches `SPACECHAT_TEST_HOOKS` now (Fix 2), so both hold
+    /// `TEST_HOOKS_ENV_LOCK` for their whole read-mutate-restore window to
+    /// avoid racing each other via this process-global env var.
     #[tokio::test]
     async fn seed_membership_is_gated_on_test_hooks_and_seeds_deterministic_peer_ids() {
         use crate::membership::SpaceMembership;
         use space_chat_transport::bootstrap::TransportConfig;
         use space_chat_transport::identity::TransportIdentity;
 
+        let _guard = TEST_HOOKS_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let identity = TransportIdentity::generate();
         let (network, events) =

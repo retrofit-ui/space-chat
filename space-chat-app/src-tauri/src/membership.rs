@@ -32,7 +32,11 @@ fn unhex(s: &str) -> Option<DeviceId> {
     }
     let mut out = [0u8; 32];
     for i in 0..32 {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        // `str::get` rather than direct slicing: a non-ASCII input can be 64
+        // *bytes* long while not landing byte-index splits on char
+        // boundaries, which would panic on direct `&s[..]` slicing.
+        let pair = s.get(i * 2..i * 2 + 2)?;
+        out[i] = u8::from_str_radix(pair, 16).ok()?;
     }
     Some(DeviceId(out))
 }
@@ -153,5 +157,18 @@ mod tests {
         let membership = PlaintextMembership::new(dir.path().join("membership.json")).unwrap();
         let name = membership.display_name(&DeviceId([0xabu8; 32]));
         assert!(name.starts_with("ab"), "expected fallback name to start with the device id's hex prefix, got {name:?}");
+    }
+
+    /// `unhex` must use `str::get` rather than direct byte-slice indexing --
+    /// a 64-*byte* string containing a multi-byte UTF-8 character can fail to
+    /// land its `i*2..i*2+2` splits on char boundaries, which would panic on
+    /// direct slicing. Mirrors `lib.rs`'s own `decode_hash_hex` /
+    /// `decode_endpoint_id_hex` non-ASCII regression tests.
+    #[test]
+    fn unhex_rejects_wrong_length_and_non_ascii_input_without_panicking() {
+        assert_eq!(unhex(""), None, "empty input must not decode");
+        assert_eq!(unhex(&"ab".repeat(20)), None, "too short must not decode");
+        assert_eq!(unhex(&"zz".repeat(32)), None, "non-hex content must not decode");
+        assert_eq!(unhex(&"é".repeat(32)), None, "non-ASCII content must error, not panic");
     }
 }

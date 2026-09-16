@@ -49,10 +49,31 @@ export async function openConversation(
     title,
   });
   let current = initial.spec;
+  let currentVersion = initial.version;
   onUpdate(current);
 
   const unlisten = await listen<ConversationPatchEvent>(`conversation-patch:${spaceId}`, (event) => {
     const payload = event.payload;
+    if (payload.version !== currentVersion + 1) {
+      // We missed something: either an event that fired in the gap between
+      // `open_conversation` resolving above and this listener being
+      // registered (Tauri events have no replay), or a genuine gap for any
+      // other reason. Blindly applying this patch would diff against a
+      // base version we don't actually have -- ask the backend to catch us
+      // up properly via LiveSpec's real full-resend path (Task 6/9)
+      // instead of silently diverging from backend state forever.
+      invoke<PatchResponse>("resync_conversation", { spaceId, sinceVersion: currentVersion })
+        .then((response) => {
+          current = applyPatchResponse(current, response);
+          currentVersion = response.version;
+          onUpdate(current);
+        })
+        .catch(() => {
+          // The conversation may have been closed in the meantime; nothing
+          // useful to do here.
+        });
+      return;
+    }
     const response: PatchResponse =
       payload.kind === "patch"
         ? { kind: "patch", version: payload.version, patch: payload.patch ?? [] }
@@ -60,6 +81,7 @@ export async function openConversation(
           ? { kind: "full", version: payload.version, spec: payload.spec as SpaceChatViewSpec }
           : { kind: "unchanged", version: payload.version };
     current = applyPatchResponse(current, response);
+    currentVersion = payload.version;
     onUpdate(current);
   });
 

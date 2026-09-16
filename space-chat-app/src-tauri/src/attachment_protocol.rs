@@ -90,10 +90,10 @@ pub fn register_attachment_protocol(builder: tauri::Builder<tauri::Wry>) -> taur
                 }
             };
 
-            let (status, body, mime): (u16, Vec<u8>, &str) = match response {
-                AttachmentResponse::Found(bytes, mime) => (200, bytes, Box::leak(mime.into_boxed_str())),
-                AttachmentResponse::Placeholder => (200, PLACEHOLDER_BYTES.to_vec(), "image/png"),
-                AttachmentResponse::NotAHash => (400, Vec::new(), "text/plain"),
+            let (status, body, mime): (u16, Vec<u8>, String) = match response {
+                AttachmentResponse::Found(bytes, mime) => (200, bytes, mime),
+                AttachmentResponse::Placeholder => (200, PLACEHOLDER_BYTES.to_vec(), "image/png".to_string()),
+                AttachmentResponse::NotAHash => (400, Vec::new(), "text/plain".to_string()),
             };
 
             let http_response = tauri::http::Response::builder()
