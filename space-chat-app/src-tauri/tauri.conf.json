@@ -13,6 +13,7 @@
     "windows": [
       { "title": "space-chat", "width": 1000, "height": 700 }
     ],
+    "withGlobalTauri": true,
     "security": { "csp": null }
   },
   "bundle": {

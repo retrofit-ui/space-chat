@@ -31,12 +31,12 @@
 //! *dedicated* `tauri-driver` (and its own `--port`/`--native-port` pair)
 //! rather than sharing one: the driver process is the carrier of the actor's
 //! identity.
-// Scaffold: `kill_actor`/`relaunch_actor`/`client(..)` and the port fields
-// exist for the scenarios Tasks 18-20 add, and there are no `.feature` files
-// yet, so nothing calls them at this point in the milestone. Kept (and
-// allowed) rather than deleted, because they are the parts of this harness
-// whose design -- keeping the data dir across a restart, one driver per actor
-// -- is the whole reason `Actor`/`RunningActor` are split the way they are.
+// Task 18's golden-path scenario exercises `spawn_actor`/`client(..)`, but
+// `kill_actor`/`relaunch_actor` and the port fields are still only used by the
+// restart-recovery scenarios Tasks 19-20 add. Kept (and allowed) rather than
+// deleted, because they are the parts of this harness whose design -- keeping
+// the data dir across a restart, one driver per actor -- is the whole reason
+// `Actor`/`RunningActor` are split the way they are.
 #![allow(dead_code)]
 use cucumber::World;
 use fantoccini::{Client, ClientBuilder};

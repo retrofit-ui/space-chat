@@ -40,7 +40,24 @@ iroh = "1"
 
 [dev-dependencies]
 tempfile = "3"
-tauri = { version = "2", features = ["test"] }
+# `custom-protocol` is what makes the E2E harness's app process load the REAL
+# built frontend instead of a dev server. `tauri`'s own build script computes
+# `dev = !custom-protocol` (verified in tauri-2.11.5's `build.rs`), and
+# `tauri-build` turns that into this crate's `cfg(dev)`; a plain `cargo build`
+# therefore produces a binary whose webview navigates to `build.devUrl`
+# (`http://localhost:1420`). Under the harness there is no dev server, so that
+# binary rendered exactly this and nothing else:
+#     <html><head></head><body>Could not connect to localhost: Connection refused</body></html>
+# (captured from a real failing run, not hypothesized). Listing the feature
+# here rather than in `[dependencies]` uses the same feature-unification trick
+# the `space-chat-transport` dev-dependency below already uses: any target
+# built by `cargo test` gets it, a production `cargo build`/`cargo run` does
+# not -- and `tauri build` supplies it itself.
+#
+# Consequence worth knowing: `cargo test` for this crate now *embeds*
+# `../dist`, so `pnpm build` must have been run at least once or
+# `tauri::generate_context!` fails the build outright.
+tauri = { version = "2", features = ["test", "custom-protocol"] }
 automerge = "0.5"
 # Turns on `space-chat-transport`'s `test-utils` feature (which forwards to
 # `iroh/test-utils`) for any test target in this crate, via feature

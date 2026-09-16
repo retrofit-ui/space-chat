@@ -4,7 +4,19 @@
 //! reporting rather than libtest's.
 //!
 //! Running this requires `tauri-driver`, `Xvfb`/`xvfb-run`, and
-//! `/usr/bin/WebKitWebDriver` to be installed -- see `world.rs`.
+//! `/usr/bin/WebKitWebDriver` to be installed -- see `world.rs`. It also
+//! requires the frontend to have been built at least once (`pnpm build` in
+//! `space-chat-app/`): the `[dev-dependencies]` `tauri` entry turns on
+//! `custom-protocol` so the app under test loads the REAL embedded frontend
+//! instead of `build.devUrl`'s dev server, and `tauri::generate_context!`
+//! fails the build outright if `../dist` is missing. See `Cargo.toml`.
+//!
+//! Because `harness = false`, cucumber -- not libtest -- parses this target's
+//! arguments, and it has no positional test-name filter. `cargo test --test
+//! cucumber golden_path` therefore fails with "unexpected argument"; the
+//! working forms are `cargo test --test cucumber` (everything),
+//! `cargo test --test cucumber -- -i '<glob>.feature'`, or
+//! `cargo test --test cucumber -- -n '<scenario name regex>'`.
 //!
 //! With an empty `features/` directory this reports zero scenarios and exits
 //! successfully. With a *missing* one it panics with "1 parsing error"
