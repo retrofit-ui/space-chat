@@ -8,6 +8,9 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
   },
+  resolve: {
+    conditions: ["development", "browser"],
+  },
   test: {
     environment: "jsdom",
     globals: true,
