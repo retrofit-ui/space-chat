@@ -15,12 +15,35 @@ function hashFromUrl(url: string): string {
 const AttachmentImage: Component<{ url: string; mime: string }> = (props) => {
   const [ready, setReady] = createSignal(false);
 
-  onMount(async () => {
+  // `onCleanup` must be registered SYNCHRONOUSLY within `onMount`'s callback,
+  // before any `await` -- SolidJS tracks the current reactive "owner" via
+  // the synchronous call stack, and that context is gone once execution
+  // resumes after an async gap. Calling `onCleanup` post-await (as an
+  // earlier version of this code did, awaiting `listen(...)` first) logs
+  // "cleanups created outside a `createRoot` or `render` will never be
+  // run" and, worse, the registered cleanup silently never fires on
+  // unmount -- confirmed by a scratch test that mounted/unmounted the
+  // component and found `unlisten` was never called. Fixed by registering
+  // `onCleanup` up front, with a `disposed` guard so the listener is torn
+  // down immediately if `listen(...)`'s promise resolves after the
+  // component has already unmounted.
+  onMount(() => {
     const hash = hashFromUrl(props.url);
-    const unlisten = await listen(`attachment-ready:${hash}`, () => {
-      setReady(true);
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    listen(`attachment-ready:${hash}`, () => setReady(true)).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
     });
-    onCleanup(() => unlisten());
+
+    onCleanup(() => {
+      disposed = true;
+      unlisten?.();
+    });
   });
 
   return (
