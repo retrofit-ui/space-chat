@@ -28,6 +28,15 @@ json-patch = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
+# Promoted from [dev-dependencies] as of the E2E-harness work: `run()` now
+# names `iroh` types directly (`RelayUrl`/`RelayConfig`/`RelayMap`/
+# `EndpointId`/`EndpointAddr`) to build a relay-pinned `TransportConfig` and to
+# reconstruct peers' dial addresses, and Rust requires a direct Cargo.toml edge
+# for that -- a transitive edge via `space-chat-transport` is not enough. NO
+# feature list here on purpose: `test-utils` must stay off for production
+# builds, and still gets unified in for test targets via the
+# `space-chat-transport = { features = ["test-utils"] }` dev-dependency below.
+iroh = "1"
 
 [dev-dependencies]
 tempfile = "3"
@@ -39,10 +48,21 @@ automerge = "0.5"
 # production binary -- mirrors the same trick `space-chat-transport` uses
 # on itself in its own Cargo.toml.
 space-chat-transport = { path = "../../space-chat-transport", features = ["test-utils"] }
-# `iroh` is only a transitive dependency via `space-chat-transport` in
-# [dependencies], which is not enough for this crate's own test code to
-# reference `iroh::test_utils::run_relay_server()` directly -- Rust requires
-# a direct Cargo.toml edge for that. Feature unification (see above) still
-# ensures this same `iroh` gets its `test-utils` feature turned on whenever
-# a test target builds, so no feature list is needed here.
-iroh = "1"
+# Adaptation vs. this task's brief, which specified `cucumber = "0.21"` /
+# `fantoccini = "0.20"`: the current published versions are 0.23 and 0.22
+# respectively, and those are what this harness is written against (verified
+# by compiling, not assumed -- see `tests/cucumber/world.rs`'s notes on the
+# API shapes that actually exist).
+cucumber = "0.23"
+fantoccini = "0.22"
+# Used by the E2E harness only, to kill an actor's whole process GROUP
+# (`xvfb-run` -> `Xvfb` + `tauri-driver` -> `WebKitWebDriver` -> the app
+# binary). Killing just the `xvfb-run` shell's own pid leaves that entire
+# tree orphaned, and cucumber builds a fresh `World` per scenario, so leaked
+# X servers/webviews would accumulate across a run.
+libc = "0.2"
+
+[[test]]
+name = "cucumber"
+harness = false
+path = "tests/cucumber/main.rs"
