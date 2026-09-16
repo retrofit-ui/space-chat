@@ -1,3 +1,4 @@
+pub mod attachment_protocol;
 pub mod commands;
 pub mod conversation_spec;
 pub mod events;
@@ -21,8 +22,10 @@ pub fn run() {
     let data_dir = dirs_data_dir();
     let local_device = load_or_create_local_device_id(&data_dir);
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    let builder = attachment_protocol::register_attachment_protocol(builder);
+
+    builder
         .setup(move |app| {
             // TODO: this generates a fresh random TransportIdentity on every
             // launch instead of persisting/reloading one the way
