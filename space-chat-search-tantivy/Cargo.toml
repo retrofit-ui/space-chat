@@ -1,0 +1,11 @@
+[package]
+name = "space-chat-search-tantivy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+space-chat-core = { path = "../space-chat-core" }
+tantivy = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

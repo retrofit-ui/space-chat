@@ -1,0 +1,13 @@
+[package]
+name = "space-chat-storage-redb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+space-chat-core = { path = "../space-chat-core" }
+redb = "2"
+
+[dev-dependencies]
+space-chat-search-tantivy = { path = "../space-chat-search-tantivy" }
+space-chat-storage-files = { path = "../space-chat-storage-files" }
+tempfile = "3"

@@ -1,0 +1,33 @@
+[package]
+name = "space-chat-transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+space-chat-core = { path = "../space-chat-core" }
+iroh = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+automerge = "0.5"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+# Dev-dependency on itself, with `test-utils` enabled: this is the standard
+# pattern for "this feature should be on whenever any test target in this
+# crate builds — unit tests in `src/`, integration tests in `tests/` — but
+# never for downstream consumers or production builds." Cargo unifies
+# features for a single package across a build graph, so enabling
+# `test-utils` here turns it on for the library itself whenever a test
+# binary (which depends on both the lib and, transitively, this dev-dep) is
+# being compiled, without it ever being on for a plain `cargo build`.
+space-chat-transport = { path = ".", features = ["test-utils"] }
+
+[features]
+# Forwards to `iroh`'s own `test-utils` feature, which gates
+# `iroh::test_utils::run_relay_server()` and
+# `iroh::tls::CaTlsConfig::insecure_skip_verify()` — both used by
+# bootstrap.rs's real-network test. Never enabled in production; see the
+# [dev-dependencies] entry above for how this crate's own tests turn it on.
+test-utils = ["iroh/test-utils"]

@@ -1,0 +1,85 @@
+[package]
+name = "space-chat-app"
+version = "0.1.0"
+description = "space-chat desktop app shell"
+authors = ["space-chat"]
+edition = "2021"
+default-run = "space-chat-app"
+
+[lib]
+name = "space_chat_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+space-chat-core = { path = "../../space-chat-core" }
+space-chat-transport = { path = "../../space-chat-transport" }
+space-chat-storage-files = { path = "../../space-chat-storage-files" }
+space-chat-storage-redb = { path = "../../space-chat-storage-redb" }
+space-chat-search-tantivy = { path = "../../space-chat-search-tantivy" }
+redb = "2"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+json-patch = "4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+# Promoted from [dev-dependencies] as of the E2E-harness work: `run()` now
+# names `iroh` types directly (`RelayUrl`/`RelayConfig`/`RelayMap`/
+# `EndpointId`/`EndpointAddr`) to build a relay-pinned `TransportConfig` and to
+# reconstruct peers' dial addresses, and Rust requires a direct Cargo.toml edge
+# for that -- a transitive edge via `space-chat-transport` is not enough. NO
+# feature list here on purpose: `test-utils` must stay off for production
+# builds, and still gets unified in for test targets via the
+# `space-chat-transport = { features = ["test-utils"] }` dev-dependency below.
+iroh = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# `custom-protocol` is what makes the E2E harness's app process load the REAL
+# built frontend instead of a dev server. `tauri`'s own build script computes
+# `dev = !custom-protocol` (verified in tauri-2.11.5's `build.rs`), and
+# `tauri-build` turns that into this crate's `cfg(dev)`; a plain `cargo build`
+# therefore produces a binary whose webview navigates to `build.devUrl`
+# (`http://localhost:1420`). Under the harness there is no dev server, so that
+# binary rendered exactly this and nothing else:
+#     <html><head></head><body>Could not connect to localhost: Connection refused</body></html>
+# (captured from a real failing run, not hypothesized). Listing the feature
+# here rather than in `[dependencies]` uses the same feature-unification trick
+# the `space-chat-transport` dev-dependency below already uses: any target
+# built by `cargo test` gets it, a production `cargo build`/`cargo run` does
+# not -- and `tauri build` supplies it itself.
+#
+# Consequence worth knowing: `cargo test` for this crate now *embeds*
+# `../dist`, so `pnpm build` must have been run at least once or
+# `tauri::generate_context!` fails the build outright.
+tauri = { version = "2", features = ["test", "custom-protocol"] }
+automerge = "0.5"
+# Turns on `space-chat-transport`'s `test-utils` feature (which forwards to
+# `iroh/test-utils`) for any test target in this crate, via feature
+# unification, without ever enabling it for a plain `cargo build` of the
+# production binary -- mirrors the same trick `space-chat-transport` uses
+# on itself in its own Cargo.toml.
+space-chat-transport = { path = "../../space-chat-transport", features = ["test-utils"] }
+# Adaptation vs. this task's brief, which specified `cucumber = "0.21"` /
+# `fantoccini = "0.20"`: the current published versions are 0.23 and 0.22
+# respectively, and those are what this harness is written against (verified
+# by compiling, not assumed -- see `tests/cucumber/world.rs`'s notes on the
+# API shapes that actually exist).
+cucumber = "0.23"
+fantoccini = "0.22"
+# Used by the E2E harness only, to kill an actor's whole process GROUP
+# (`xvfb-run` -> `Xvfb` + `tauri-driver` -> `WebKitWebDriver` -> the app
+# binary). Killing just the `xvfb-run` shell's own pid leaves that entire
+# tree orphaned, and cucumber builds a fresh `World` per scenario, so leaked
+# X servers/webviews would accumulate across a run.
+libc = "0.2"
+
+[[test]]
+name = "cucumber"
+harness = false
+path = "tests/cucumber/main.rs"

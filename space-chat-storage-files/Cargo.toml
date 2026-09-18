@@ -1,0 +1,10 @@
+[package]
+name = "space-chat-storage-files"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+space-chat-core = { path = "../space-chat-core" }
+
+[dev-dependencies]
+tempfile = "3"
