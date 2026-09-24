@@ -51,6 +51,15 @@ async fn given_actors_share_membership(world: &mut SpaceChatWorld, a: String, b:
     seed_membership(world.client(&b), &b, &[a]).await;
 }
 
+/// Three-way version: every actor learns about both others. Same seeding
+/// mechanism and same caveat as the pairwise step above.
+#[given(regex = r"^(\w+) and (\w+) and (\w+) share membership in the space$")]
+async fn given_three_actors_share_membership(world: &mut SpaceChatWorld, a: String, b: String, c: String) {
+    seed_membership(world.client(&a), &a, &[b.clone(), c.clone()]).await;
+    seed_membership(world.client(&b), &b, &[a.clone(), c.clone()]).await;
+    seed_membership(world.client(&c), &c, &[a, b]).await;
+}
+
 async fn seed_membership(client: &Client, actor_name: &str, peer_names: &[String]) {
     // `arguments`'s last element is the completion callback the remote end
     // appends (W3C "Execute Async Script"); `fantoccini::Client::execute_async`
@@ -95,6 +104,19 @@ async fn when_actor_sends_message(world: &mut SpaceChatWorld, name: String, cont
     button.click().await.unwrap_or_else(|e| panic!("could not click {name}'s send button: {e}"));
 }
 
+/// Sends every row of the step's data table back to back through the same
+/// real composer path as the single-message step -- no batching shortcut, so
+/// each row is its own `send_message` round trip and its own patch.
+#[when(regex = r"^(\w+) sends the messages:$")]
+async fn when_actor_sends_messages(world: &mut SpaceChatWorld, step: &cucumber::gherkin::Step, name: String) {
+    let table = step.table.as_ref().unwrap_or_else(|| panic!("'{name} sends the messages:' needs a data table"));
+    assert!(!table.rows.is_empty(), "the data table for {name}'s burst is empty");
+    for row in &table.rows {
+        let content = row.first().unwrap_or_else(|| panic!("empty row in {name}'s message table"));
+        when_actor_sends_message(world, name.clone(), content.clone()).await;
+    }
+}
+
 /// Delegates to the existing `when_actor_sends_message` step function -- same
 /// real send path (composer input + send button, through the real running
 /// app), just phrased as a `Given` (a precondition for this scenario) rather
@@ -124,15 +146,42 @@ async fn given_actor_has_sent_message(world: &mut SpaceChatWorld, name: String, 
 /// the killed webview.
 #[when(regex = r"^(\w+)'s app process is killed and relaunched against the same data directory$")]
 async fn when_actor_process_killed_and_relaunched(world: &mut SpaceChatWorld, name: String) {
-    let data_dir_before = world.actor(&name).data_dir.path().to_path_buf();
+    when_actor_process_killed(world, name.clone()).await;
+    when_actor_process_relaunched(world, name).await;
+}
+
+/// The kill half on its own, for scenarios that need something to happen
+/// (a message sent by someone else) while the actor is down.
+#[when(regex = r"^(\w+)'s app process is killed$")]
+async fn when_actor_process_killed(world: &mut SpaceChatWorld, name: String) {
+    let webdriver_port = world
+        .actor(&name)
+        .running
+        .as_ref()
+        .unwrap_or_else(|| panic!("{name:?} is not running, so there is nothing to kill"))
+        .webdriver_port;
     world.kill_actor(&name).await;
     assert!(
         world.actor(&name).running.is_none(),
         "kill_actor did not clear {name:?}'s RunningActor -- later steps would resolve to a stale \
-         WebDriver session rather than the fresh one relaunch_actor is about to create (this checks \
-         the field kill_actor clears, not that the underlying OS process has actually died -- see \
-         kill_process_group for the real teardown signal)"
+         WebDriver session rather than the fresh one relaunch_actor is about to create"
     );
+    // The field above is what kill_actor clears; this is the OS-level
+    // evidence. If the driver still answered here, a message "sent while
+    // {name} was down" could be delivered live to a not-yet-dead app, and a
+    // catch-up scenario would pass without exercising catch-up at all.
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", webdriver_port)).await.is_err(),
+        "{name:?}'s tauri-driver still accepts connections on port {webdriver_port} after kill_actor"
+    );
+}
+
+/// The relaunch half. The data-dir path is read from the `Actor` record that
+/// survived the kill, so "same data directory" is checked against what the
+/// actor was spawned with, not against a value the scenario has to carry.
+#[when(regex = r"^(\w+)'s app process is relaunched against the same data directory$")]
+async fn when_actor_process_relaunched(world: &mut SpaceChatWorld, name: String) {
+    let data_dir_before = world.actor(&name).data_dir.path().to_path_buf();
     world.relaunch_actor(&name).await;
     // Cheap guard against the one way this whole scenario could pass for the
     // wrong reason: a "relaunch" that quietly started against a DIFFERENT (or
